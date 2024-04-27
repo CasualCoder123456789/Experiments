@@ -1,0 +1,101 @@
+from typing import List, Optional, Union
+from vllm.engine.llm_engine import LLMEngine
+from vllm.engine.arg_utils import EngineArgs
+from vllm.usage.usage_lib import UsageContext
+from vllm.utils import Counter
+from vllm.outputs import RequestOutput
+from vllm import SamplingParams
+from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
+import gradio as gr
+import torch
+import time
+
+global queries
+queries = []
+
+class StreamingLLM:
+    def __init__(
+        self,
+        model: str,
+        dtype: str = "auto",
+        quantization: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        engine_args = EngineArgs(model=model, quantization=quantization, dtype=dtype, enforce_eager=True)
+        self.llm_engine = LLMEngine.from_engine_args(engine_args, usage_context=UsageContext.LLM_CLASS)
+        self.request_counter = Counter()
+
+    def generate(
+        self,
+        prompt: Optional[str] = None,
+        sampling_params: Optional[SamplingParams] = None
+    ) -> List[RequestOutput]:
+        
+        request_id = str(next(self.request_counter))
+        self.llm_engine.add_request(request_id, prompt, sampling_params)
+
+        current_output = ""
+        
+        while self.llm_engine.has_unfinished_requests():
+            step_outputs = self.llm_engine.step()
+            for output in step_outputs:
+                #for chunk in output:
+                post(output.outputs[0].text[len(current_output):])
+                current_output = output.outputs[0].text
+                # yield output
+import socketio
+
+# Initialize Socket.IO client
+sio = socketio.Client()
+
+@sio.event
+def connect():
+    print('Connected to server')
+    sio.emit('llm', {"text": ""})
+
+@sio.on('query')
+def query(data):
+    print('Received Query')
+    queries.append(data['query'])
+    
+
+def post(text):
+    sio.emit('tokens', {"text": text})
+
+if __name__ == "__main__":
+    sio.connect('http://127.0.0.1:8000')
+
+    llm = StreamingLLM(model="/mnt/184477A244778174/Models/llama-3-8b-instruct-awq", quantization="AWQ", dtype="float16")
+    tokenizer = llm.llm_engine.tokenizer.tokenizer
+    sampling_params = SamplingParams(temperature=0.6,
+                                     top_p=0.9,
+                                     max_tokens=4096,
+                                     stop_token_ids=[tokenizer.eos_token_id, tokenizer.convert_tokens_to_ids("<|eot_id|>")]
+                                     )
+    # question = "what is life?"
+    # prompt_pieces = []
+    # prompt_pieces.append({"role": "system", "content": "You are an AI assistant. You will answer questions accurately and prioritize shorter response if possible."})
+    # prompt_pieces.append({"role": "user", "content": question})
+
+    # prompt = tokenizer.apply_chat_template(prompt_pieces, tokenize=False)
+
+    # llm.generate(prompt, sampling_params=sampling_params)
+
+    while(True):
+        if len(queries) == 0:
+            time.sleep(1)
+        
+        else:
+            question = queries.pop(0)
+            
+            print("Query received:", question)
+            prompt_pieces = []
+            prompt_pieces.append({"role": "system", "content": "You are an AI assistant. You will answer questions accurately and prioritize shorter response if possible."})
+            prompt_pieces.append({"role": "user", "content": question})
+      
+            prompt = tokenizer.apply_chat_template(prompt_pieces, tokenize=False)
+
+            llm.generate(prompt, sampling_params=sampling_params)
+               
+
+# Event handler for 'connect' event
