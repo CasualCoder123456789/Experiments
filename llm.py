@@ -65,7 +65,7 @@ def post(text):
 if __name__ == "__main__":
     sio.connect('http://127.0.0.1:8000')
 
-    llm = StreamingLLM(model="/mnt/184477A244778174/Models/llama-3-8b-instruct-awq", quantization="AWQ", dtype="float16")
+    llm = StreamingLLM(model="Models/llama-3-8b-instruct-awq", quantization="AWQ", dtype="float16")
     tokenizer = llm.llm_engine.tokenizer.tokenizer
     sampling_params = SamplingParams(temperature=0.6,
                                      top_p=0.9,
