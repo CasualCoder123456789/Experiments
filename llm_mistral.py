@@ -63,17 +63,14 @@ def query(data):
     print('Received Query')
     queries.append(data)
     question = queries.pop(0)
-    # prompt_pieces = []
-    # prompt_pieces.append({"role": "assistant", "content": "You are an AI assistant. You will answer questions accurately and prioritize shorter response if possible."})
+    prompt_pieces = []
+    prompt_pieces.append({"role": "user", "content": question['prompt'] + "\n" + question['query']})
     # prompt_pieces.append({"role": "user", "content": question['query']})
 
-    # prompt = tokenizer.apply_chat_template(prompt_pieces, tokenize=False)
-
-    prompt = f"<s>[INST] You are an AI assistant. You will answer questions accurately and prioritize shorter response if possible. Query: {question['query']} <[/INST]>"
+    prompt = tokenizer.apply_chat_template(prompt_pieces, tokenize=False)
 
     llm.generate(prompt, sampling_params=sampling_params, sid=question['sid'])
     
-
 def post(text, sid):
     sio.emit('tokens', {"text": text, "sid": sid})
 
