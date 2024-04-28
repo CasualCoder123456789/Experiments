@@ -2,6 +2,7 @@ packaging
 vllm==0.4.0.post1
 autoawq==0.2.3
 flash-attn==2.5.7
+python-socketio
 
 def handle_query(data):
 
