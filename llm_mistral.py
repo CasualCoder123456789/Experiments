@@ -6,7 +6,6 @@ from vllm.utils import Counter
 from vllm.outputs import RequestOutput
 from vllm import SamplingParams
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
-import gradio as gr
 import torch
 import time
 
