@@ -1,0 +1,34 @@
+function formatCodeBlocks() {
+        var messages = document.querySelectorAll('.message');
+        messages.forEach(function(message) {
+          console.log("here");
+          var output = message.querySelector('.message-text');
+          var text = output.textContent;
+
+          // Regular expression to detect code snippets
+          var codePattern = /```([\s\S]*?)```/g;
+          var matches = text.match(codePattern);
+
+          // Replace detected code snippets with formatted HTML
+          if (matches !== null) {
+            // console.log(matches);
+            matches.forEach(function(match) {
+              // console.log(match)
+              var code = match.trim();
+              var formattedCode = '<div class="code-window"><pre><code class="code-block">' + code + '</code></pre></div>';
+              text = text.replace(match, formattedCode);
+            });
+          }
+
+          // Update the output with formatted HTML
+          output.innerHTML = text;
+        });
+      }
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.4.0/highlight.min.js"></script>
+   
+## when message
+          formatCodeBlocks();
+            var codeStuff = document.querySelectorAll('pre code');
+            codeStuff.forEach((block) => {
+              hljs.highlightElement(block);
+            });
