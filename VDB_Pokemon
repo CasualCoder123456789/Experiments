@@ -1,0 +1,143 @@
+import csv
+
+def getPokemon():
+    
+
+    with open("Pokemon/Data/complete_pokedex.csv") as csvfile:
+        spamreader = csv.reader(csvfile)
+
+        pokemon = None
+        keys = None
+        for row in spamreader:
+            if pokemon == None:
+                pokemon = []
+                keys = ['#', 'Name', 'Type A', 'Type B', 'HP', 'Attack', 'Defense', 'Sp. Attack', 'Sp. Defense', 'Speed', 'Total', '4x', '2x', '0.5x', '0.25x', '0x', 'Ability 1', 'Ability 2', 'Hidden Ability', 'Egg Group 1', 'Egg Group 2', 'Egg Cycles', 'Percent Male', 'Catch Rate', 'Growth Rate', 'Species', 'Height', 'Weight']
+            else:
+                entry = {}
+                for k, e in zip(keys, row):
+                    entry[k] = e
+                pokemon.append(entry)
+    return pokemon
+
+types = ['Grass', 'Poison', 'Fire', '', 'Flying', 'Dragon', 'Water', 'Bug', 'Normal', 'Dark', 'Electric', 'Psychic', 'Ground', 'Ice', 'Steel', 'Fairy', 'Fighting', 'Rock', 'Ghost']
+
+from neo4j import GraphDatabase
+
+# URI examples: "neo4j://localhost", "neo4j+s://xxx.databases.neo4j.io"
+URI = "neo4j://localhost:7687"
+AUTH = ("neo4j", "neo4j123")
+
+with GraphDatabase.driver(URI, auth=AUTH) as driver:
+    driver.verify_connectivity()
+
+    for pokemon in getPokemon():
+        summary = driver.execute_query(
+            """ 
+            MERGE (p:Pokemon {name: $name, hp: $hp, attack: $attack, defense: $defense, sp_attack: $sp_attack, sp_defense: $sp_defense, speed: $speed, total: $total})
+            MERGE (a:Ability {name: $ability1})
+            MERGE (t:Type {name: $type1})
+            MERGE (e:EggGroup {name: $egg1})
+            MERGE (p)-[:TYPE]->(t)
+            MERGE (p)-[:ABILITY]->(a)
+            MERGE (p)-[:EGGGROUP]->(e)
+            """,
+            name=pokemon['Name'],
+            hp=int(pokemon['HP']),
+            attack=int(pokemon['Attack']),
+            defense=int(pokemon['Defense']),
+            speed=int(pokemon['Speed']),
+            sp_attack=int(pokemon['Sp. Attack']),
+            sp_defense=int(pokemon['Sp. Defense']),
+            total=int(pokemon['Total']),
+            type1=pokemon['Type A'],
+            ability1=pokemon['Ability 1'],
+            egg1=pokemon['Egg Group 1'],
+            database_="neo4j",
+        ).summary
+        print("Created {nodes_created} nodes in {time} ms.".format(
+            nodes_created=summary.counters.nodes_created,
+            time=summary.result_available_after
+        ))
+        if pokemon['Type B'] != "":
+            summary = driver.execute_query(
+            """ 
+            MERGE (p:Pokemon {name: $name})
+            MERGE (t:Type {name: $type2})
+            MERGE (p)-[:TYPE]->(t)
+            """,
+            name=pokemon['Name'],
+            type2=pokemon['Type B'],
+            database_="neo4j",
+        ).summary
+        print("Created {nodes_created} nodes in {time} ms.".format(
+            nodes_created=summary.counters.nodes_created,
+            time=summary.result_available_after
+        ))
+        if pokemon['Ability 2'] != "":
+            summary = driver.execute_query(
+            """ 
+            MERGE (p:Pokemon {name: $name})
+            MERGE (a:Ability {name: $ability2})
+            MERGE (p)-[:ABILITY]->(a)
+            """,
+            name=pokemon['Name'],
+            ability2=pokemon['Ability 2'],
+            database_="neo4j",
+        ).summary
+        print("Created {nodes_created} nodes in {time} ms.".format(
+            nodes_created=summary.counters.nodes_created,
+            time=summary.result_available_after
+        ))
+        if pokemon['Hidden Ability'] != "":
+            summary = driver.execute_query(
+            """ 
+            MERGE (p:Pokemon {name: $name})
+            MERGE (a:Ability {name: $ability3})
+            MERGE (p)-[:HIDDENABILITY]->(a)
+            """,
+            name=pokemon['Name'],
+            ability3=pokemon['Hidden Ability'],
+            database_="neo4j",
+        ).summary
+        print("Created {nodes_created} nodes in {time} ms.".format(
+            nodes_created=summary.counters.nodes_created,
+            time=summary.result_available_after
+        ))
+        if pokemon['Egg Group 2'] != "":
+            summary = driver.execute_query(
+            """ 
+            MERGE (p:Pokemon {name: $name})
+            MERGE (e:EggGroup {name: $egg2})
+            MERGE (p)-[:EGGGROUP]->(e)
+            """,
+            name=pokemon['Name'],
+            egg2=pokemon['Egg Group 2'],
+            database_="neo4j",
+        ).summary
+        print("Created {nodes_created} nodes in {time} ms.".format(
+            nodes_created=summary.counters.nodes_created,
+            time=summary.result_available_after
+        ))
+        # break
+    # for pokemon in getPokemon():
+    #     summary = driver.execute_query(
+    #         "CREATE CONSTRAINT Pokemon_name FOR (pokemon:Pokemon) REQUIRE pokemon.name IS UNIQUE",
+    #         database_="neo4j",
+    #     ).summary
+    #     print("Created {nodes_created} nodes in {time} ms.".format(
+    #         nodes_created=summary.counters.nodes_created,
+    #         time=summary.result_available_after
+    #     ))
+    #     break
+
+    # for t in types:
+    #     summary = driver.execute_query(
+    #         "CREATE (:Type {name: $name})",
+    #         name=t,
+    #         database_="neo4j",
+    #     ).summary
+    #     print("Created {nodes_created} nodes in {time} ms.".format(
+    #         nodes_created=summary.counters.nodes_created,
+    #         time=summary.result_available_after
+    #     ))
+        # break
