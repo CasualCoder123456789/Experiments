@@ -1,0 +1,44 @@
+<html lang="en" xml:lang="en">
+
+    <link rel="stylesheet" href="{{ url_for('static', filename='dropdown.css')}}" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='lightsabers.css')}}" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='spinner.css')}}" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='fourcircle.css')}}" />
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.2.0/socket.io.js"></script>
+
+<body>
+  <h1>Lightsaber Fight Loader</h1>
+  <div id="loader_saber">
+    <div class="ls-particles ls-part-1"></div>
+    <div class="ls-particles ls-part-2"></div>
+    <div class="ls-particles ls-part-3"></div>
+    <div class="ls-particles ls-part-4"></div>
+    <div class="ls-particles ls-part-5"></div>
+    <div class="lightsaber ls-left ls-green"></div>
+    <div class="lightsaber ls-right ls-red"></div>
+  </div>
+  <br>
+
+  <p>Here is a pure CSS spinner that scales beautifully without images or JavaScript.</p>
+  <span class="spinner"></span>
+
+  <p>How about a bigger one?</p>
+  <span class="spinner spinner-large"></span>
+
+  <p>Or a slow one?</p>
+  <span class="spinner spinner-slow"></span>
+
+  <p>Or a blue one?</p>
+  <span class="spinner spinner-blue"></span>
+
+  <p>You can combine variations like this.</p>
+  <span class="spinner spinner-large spinner-blue spinner-slow"></span>
+
+  <br>
+  <div class="loader"></div>
+  
+
+</body>
+
+</html>
