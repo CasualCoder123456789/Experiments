@@ -1,0 +1,161 @@
+<html lang="en" xml:lang="en">
+{% extends 'base.html' %}
+
+{% block title %}Tab 1{% endblock %}
+
+{% block extra_head %}
+    <link rel="stylesheet" href="{{ url_for('static', filename='dropdown.css')}}" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='chat.css')}}" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='fourcircle.css')}}" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='lightsabers.css')}}" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.2.0/socket.io.js"></script>
+
+{% endblock %}
+{% block content %}
+
+    <div class="chat-container">
+
+      <h2 class="chat-header">
+        <span style="color: white;">Current Group:</span>
+        <div class="dropdown">
+          <!-- Selected option -->
+          <div class="selected-option" onclick="toggleDropdown()">Select an option</div>
+
+          <!-- Dropdown content -->
+          <div class="dropdown-content" id="dropdownContent">
+            {% for option in options %}
+              <button onclick="selectOption('{{ option }}')">{{ option }}</button>
+            {% endfor %}
+          </div>
+        </div>
+      </h2>
+      <div class="message-container">
+        <div class="chat-messages">
+          <div class="message blue-bg">
+            <div class="message-sender">John</div>
+            <div class="message-text">Hey Jane, what's up?</div>
+            <div class="message-timestamp">10:30 AM</div>
+          </div>
+          <div class="message gray-bg">
+            <div class="message-sender">Jane</div>
+            <div class="message-text">Not much, just living the dream. How about you?</div>
+            <div class="message-timestamp">10:35 AM</div>
+          </div>
+        </div>
+      </div>
+      <div class="chat-input-wrapper">
+        <form class="chat-input-form">
+          <input type="textarea" class="chat-input" required placeholder="Type here, John..." />
+          <!-- <div class="loader_saber" id="loading"></div> -->
+          <div class="loader_saber" id="loading">
+            <div class="ls-particles ls-part-1"></div>
+            <div class="ls-particles ls-part-2"></div>
+            <div class="ls-particles ls-part-3"></div>
+            <div class="ls-particles ls-part-4"></div>
+            <div class="ls-particles ls-part-5"></div>
+            <div class="lightsaber ls-left ls-green"></div>
+            <div class="lightsaber ls-right ls-red"></div>
+          </div>
+          <button type="button" onclick="sendMessage()" class="button send-button">Send</button>
+        </form>
+      </div>
+
+      <button class="button clear-chat-button">Clear Chat</button>
+      
+    </div>
+
+    <script src="{{ url_for('static', filename='chat.js')}}"></script>
+    <script>
+
+        var socket = io.connect('http://' + document.domain + ':' + location.port);
+
+        socket.on('image_message', function(imageData) {
+            const timestamp = new Date().toLocaleString('en-US', { hour: 'numeric', minute: 'numeric', hour12: true });
+            const message = {
+              sender: "Model",
+              text: "",
+              timestamp,
+              imageData: imageData,
+            };
+
+            chatMessages.innerHTML += createImageMessageElement(message);
+
+        });
+        // const socket = io();
+
+        function toggleDropdown() {
+            var dropdownContent = document.getElementById("dropdownContent");
+            dropdownContent.style.display = dropdownContent.style.display === "block" ? "none" : "block";
+        }
+
+        // socket.emit('join', {sid: '{{ request.sid }}'});
+
+        function selectOption(option) {
+            var selectedOption = document.querySelector(".selected-option");
+            selectedOption.textContent = option;
+            toggleDropdown();
+        }
+
+        function sendMessage() {
+
+          const timestamp = new Date().toLocaleString('en-US', { hour: 'numeric', minute: 'numeric', hour12: true });
+          const message = {
+            sender: "You",
+            text: "what ever text",
+            timestamp,
+          };
+
+          chatMessages.innerHTML += createChatMessageElement(message);
+          socket.emit("query", message);
+          document.getElementById('loading').style.display = "block";
+        }
+
+        function trial() {
+          var text = "Message ";
+          const lastMessageElement = chatMessages.lastElementChild;
+
+          if (lastMessageElement) {
+            const messageTextElement = lastMessageElement.querySelector('.message-text');
+            if (messageTextElement) {
+              messageTextElement.textContent = messageTextElement.textContent + text;
+              // lastMessageElement.querySelector('.message-timestamp').textContent = timestamp;
+            }
+          }
+          /*  Scroll to bottom of chat messages */
+          messageContainer.scrollTop = messageContainer.scrollHeight;
+        }
+
+        socket.on('tokens', function(data) {
+          const lastMessageElement = chatMessages.lastElementChild;
+
+          if (lastMessageElement) {
+            const messageTextElement = lastMessageElement.querySelector('.message-text');
+            if (messageTextElement) {
+              messageTextElement.textContent = messageTextElement.textContent + data['text'];
+              // lastMessageElement.querySelector('.message-timestamp').textContent = timestamp;
+            }
+          }
+          /*  Scroll to bottom of chat messages */
+          messageContainer.scrollTop = messageContainer.scrollHeight;
+        });
+
+        socket.on('finished', function(data) {
+          const lastMessageElement = chatMessages.lastElementChild;
+
+          if (lastMessageElement) {
+            const messageTextElement = lastMessageElement.querySelector('.message-text');
+            if (messageTextElement) {
+              messageTextElement.textContent = data['text'];
+              // lastMessageElement.querySelector('.message-timestamp').textContent = timestamp;
+            }
+          }
+          /*  Scroll to bottom of chat messages */
+          messageContainer.scrollTop = messageContainer.scrollHeight;
+          document.getElementById('loading').style.display = "none";
+        });
+
+        // setInterval(trial, 1000);
+    </script>
+
+{% endblock %}
+</html>
