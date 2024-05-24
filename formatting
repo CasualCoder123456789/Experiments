@@ -1,0 +1,36 @@
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.4.0/styles/default.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.4.0/highlight.min.js"></script>
+    
+
+
+        socket.on('message', function(data) {
+          const lastMessageElement = chatMessages.lastElementChild;
+
+          if (lastMessageElement) {
+            const messageTextElement = lastMessageElement.querySelector('.message-text');
+            if (messageTextElement) {
+              // messageTextElement.value = formatCode(messageTextElement.textContent + data.text);
+              messageTextElement.innerHTML = formatCode(messageTextElement.innerHTML + data.text);
+              
+              const codeElement = messageTextElement.querySelector('pre code');
+              if (codeElement) {
+                console.log("CODE");
+                console.log(data.text);
+                hljs.highlightElement(codeElement);
+              }
+              // lastMessageElement.querySelector('.message-timestamp').textContent = timestamp;
+            }
+          }
+
+          /*  Scroll to bottom of chat messages */
+          messageContainer.scrollTop = messageContainer.scrollHeight;
+            // var codeStuff = document.querySelectorAll('pre code');
+            // codeStuff.forEach((block) => {
+            //   hljs.highlightElement(block);
+            // });
+        });
+        function formatCode(text) {
+          // Regular expression to match code snippets within the text
+          const codeRegex = /```([^`]+)```/g;
+          return text.replace(codeRegex, '<pre><code class="code">$1</code></pre>');
+        }
