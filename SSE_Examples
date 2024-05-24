@@ -72,3 +72,47 @@ if __name__ == '__main__':
     </form>
 </body>
 </html>
+####### with get
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>SSE Example</title>
+    <script>
+        document.addEventListener("DOMContentLoaded", function() {
+            const userChannel = "{{ user_channel }}";
+
+            // Function to make GET request and handle response
+            function fetchData() {
+                const model = 'example_model';  // Example model string
+                const days = 7;  // Example number of days
+
+                // Making the GET request
+                fetch(`/get_data?model=${model}&days=${days}`)
+                    .then(response => response.json())
+                    .then(data => {
+                        console.log('Received data:', data);
+                        // Saving the received JSON data to a variable
+                        window.receivedData = data;
+                    })
+                    .catch(error => console.error('Error fetching data:', error));
+            }
+
+            // Event listener for the button click
+            document.getElementById('fetchButton').addEventListener('click', fetchData);
+        });
+    </script>
+</head>
+<body>
+    <h1>Messages</h1>
+    <div id="messages"></div>
+    <form method="POST" action="/send_message">
+        <input type="text" name="message" placeholder="Type your message here">
+        <input type="hidden" name="user_id" value="{{ session['user_id'] }}">
+        <button type="submit">Send</button>
+    </form>
+
+    <!-- Button to fetch data -->
+    <button id="fetchButton">Fetch Data</button>
+</body>
+</html>
