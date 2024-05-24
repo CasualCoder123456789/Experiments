@@ -1,0 +1,74 @@
+from flask import Flask, session, request, render_template
+from flask_sse import sse
+import redis
+import uuid
+
+app = Flask(__name__)
+app.config["REDIS_URL"] = "redis://localhost:6379"
+app.config["SECRET_KEY"] = "your_secret_key"
+app.register_blueprint(sse, url_prefix='/stream')
+
+# Redis connection
+redis_store = redis.StrictRedis.from_url(app.config["REDIS_URL"])
+
+# In-memory store for user channels (you may want to persist this in a database)
+user_channels = {}
+
+@app.route('/')
+def index():
+    # Generate a unique user ID and store it in the session
+    if 'user_id' not in session:
+        session['user_id'] = str(uuid.uuid4())
+    
+    user_id = session['user_id']
+    # Ensure each user has a unique channel
+    if user_id not in user_channels:
+        user_channels[user_id] = str(uuid.uuid4())
+    
+    user_channel = user_channels[user_id]
+    
+    return render_template('index.html', user_channel=user_channel)
+
+@app.route('/send_message', methods=['POST'])
+def send_message():
+    message = request.form['message']
+    target_user_id = request.form['user_id']
+    
+    if target_user_id in user_channels:
+        target_channel = user_channels[target_user_id]
+        sse.publish({"message": message}, type='message', channel=target_channel)
+    
+    return 'Message sent!', 200
+
+if __name__ == '__main__':
+    app.run(debug=True)
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>SSE Example</title>
+    <script>
+        document.addEventListener("DOMContentLoaded", function() {
+            const userChannel = "{{ user_channel }}";
+            const source = new EventSource("/stream?channel=" + userChannel);
+            
+            source.addEventListener('message', function(event) {
+                const data = JSON.parse(event.data);
+                const messageElement = document.createElement('p');
+                messageElement.textContent = data.message;
+                document.getElementById('messages').appendChild(messageElement);
+            });
+        });
+    </script>
+</head>
+<body>
+    <h1>Messages</h1>
+    <div id="messages"></div>
+    <form method="POST" action="/send_message">
+        <input type="text" name="message" placeholder="Type your message here">
+        <input type="hidden" name="user_id" value="{{ session['user_id'] }}">
+        <button type="submit">Send</button>
+    </form>
+</body>
+</html>
