@@ -6,196 +6,324 @@
 {% block extra_head %}
     <link rel="stylesheet" href="{{ url_for('static', filename='dropdown.css')}}" />
     <link rel="stylesheet" href="{{ url_for('static', filename='chat.css')}}" />
-    <link rel="stylesheet" href="{{ url_for('static', filename='fourcircle.css')}}" />
-    <link rel="stylesheet" href="{{ url_for('static', filename='lightsabers.css')}}" />
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.2.0/socket.io.js"></script>
-    <!-- <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.4.0/styles/tomorrow-night-bright.min.css"> -->
     <link rel="stylesheet" href="{{ url_for('static', filename='dark.css')}}">
-    <link rel="stylesheet" href="{{ url_for('static', filename='copybar.css')}}">
-    <!-- <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.4.0/highlight.min.js"></script> -->
-    <script src="{{ url_for('static', filename='highlightme.js')}}"></script>
+    <script src="{{ url_for('static', filename='highlight.min.js')}}"></script>
+    <script src="{{ url_for('static', filename='python.min.js')}}"></script>
+    <script src="{{ url_for('static', filename='javascript.min.js')}}"></script>
+    <script src="{{ url_for('static', filename='java.min.js')}}"></script>
+
+    
 {% endblock %}
 {% block content %}
-
-    <div class="chat-container">
-
-      <h2 class="chat-header">
-        <span style="color: white;">Current Group:</span>
-        <div class="dropdown">
-          <!-- Selected option -->
-          <div class="selected-option" onclick="toggleDropdown()">Select an option</div>
-
-          <!-- Dropdown content -->
-          <div class="dropdown-content" id="dropdownContent">
-            {% for option in options %}
-              <button onclick="selectOption('{{ option }}')">{{ option }}</button>
-            {% endfor %}
-          </div>
-        </div>
-      </h2>
-      <div class="message-container">
-        <div class="chat-messages">
-          <div class="message blue-bg">
-            <div class="message-sender">John</div>
-            <div class="message-text">Hey Jane, what's up?</div>
-            <div class="message-timestamp">10:30 AM</div>
-          </div>
-          <div class="message gray-bg">
-            <div class="message-sender">Jane</div>
-            <div class="message-text">Not much, just living the dream. How about you?</div>
-            <div class="message-timestamp">10:35 AM</div>
-          </div>
-        </div>
-      </div>
-      <div class="chat-input-wrapper">
-        <form class="chat-input-form">
-          <input type="textarea" class="chat-input" required placeholder="Type here, John..." />
-          <!-- <div class="loader_saber" id="loading"></div> -->
-          <div class="loader_saber" id="loading">
-            <div class="ls-particles ls-part-1"></div>
-            <div class="ls-particles ls-part-2"></div>
-            <div class="ls-particles ls-part-3"></div>
-            <div class="ls-particles ls-part-4"></div>
-            <div class="ls-particles ls-part-5"></div>
-            <div class="lightsaber ls-left ls-green"></div>
-            <div class="lightsaber-bottom ls-right ls-red"></div>
-            <div class="lightsaber ls-right ls-red"></div>
-            <!-- <div class="lightsaber-bottom ls-right ls-purple"></div> -->
-          </div>
-          <button type="button" onclick="sendMessage()" class="button send-button">Send</button>
-        </form>
-      </div>
-
-      <button class="button clear-chat-button">Clear Chat</button>
-      
+    <div id="errorBanner" class="error-banner">
+      <span id="errorMessage"></span>
     </div>
 
+    <div class="main-container">
+      <button onclick="showErrorBanner()">Show Error Banner</button>
+      <div class="samples-container">
+        <!-- <div class="samples-wrapper"> -->
+          <button class="button" onclick="samplePrompts(1)">Base</button>
+          <button class="button" onclick="samplePrompts(2)">JSON</button>
+          <button class="button" onclick="samplePrompts(3)">Summarize</button>
+          <button class="button" onclick="samplePrompts(4)">Cypher</button>
+          <button class="button" onclick="samplePrompts(5)">XXX</button>
+        <!-- </div> -->
+      </div>
+      <div class="chat-container">
+
+        <h2 class="chat-header">
+          <span style="color: white;">Current Group:</span>
+          <div class="dropdown">
+            <!-- Selected option -->
+            <div class="selected-option" onclick="toggleDropdown()">Select an option</div>
+
+            <!-- Dropdown content -->
+            <div class="dropdown-content" id="dropdownContent">
+              {% for option in options %}
+                <button onclick="selectOption('{{ option }}')">{{ option }}</button>
+              {% endfor %}
+            </div>
+          </div>
+        </h2>
+        <div class="message-container">
+          <div class="chat-messages">
+          </div>
+        </div>
+        <div class="chat-input-form" id="chatInput2" style="display: none">
+          <textarea id='textBox2' type="text" class="chat-input" required placeholder="Enter JSON rules here..."></textarea>
+        </div>
+        <div class="chat-input-form">
+          <textarea id='textBox' type="text" class="chat-input" required placeholder="Type here, John..."></textarea>
+          <button type="button" class="button send-button" onclick="sendMessage()">Send</button>
+        </div>
+
+        <button class="button clear-chat-button">Clear Chat</button>
+      </div>
+
+    </div>
+    <div id='prompt' type="text" style="display: none;" hidden>base</div>
+
+
+    
+    
+    <!-- <script src="{{ url_for('static', filename='highlight/highlight.min.js')}}"></script>
+    <script>hljs.highlightAll();</script> -->
+
     <script src="{{ url_for('static', filename='chat.js')}}"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js" integrity="sha512-q/dWJ3kcmjBLU4Qc47E4A9kTB4m3wuTY7vkFJDTZKjTs8jhyGQnaUrxa0Ytd0ssMZhbNua9hE+E7Qv1j+DyZwA==" crossorigin="anonymous"></script>
+
     <script>
 
-        var socket = io.connect('http://' + document.domain + ':' + location.port);
+      function formatCodeBlocks() {
+        var messages = document.querySelectorAll('.message');
+        messages.forEach(function(message) {
+          console.log("here");
+          var output = message.querySelector('.message-text');
+          var text = output.textContent;
 
-        socket.on('image_message', function(imageData) {
-            const timestamp = new Date().toLocaleString('en-US', { hour: 'numeric', minute: 'numeric', hour12: true });
-            const message = {
-              sender: "Model",
-              text: "",
-              timestamp,
-              imageData: imageData,
-            };
+          // Regular expression to detect code snippets
+          var codePattern = /```([\s\S]*?)```/g;
+          var matches = text.match(codePattern);
 
-            chatMessages.innerHTML += createImageMessageElement(message);
+          // Replace detected code snippets with formatted HTML
+          if (matches !== null) {
+            // console.log(matches);
+            matches.forEach(function(match) {
+              // console.log(match)
+              var code = match.trim();
+              var formattedCode = '<div class="code-window"><pre><code class="language-python">' + code + '</code></pre></div>';
+              text = text.replace(match, formattedCode);
+            });
+          }
 
+          // Update the output with formatted HTML
+          output.innerHTML = text;
         });
-        // const socket = io();
+      }
+
+        var value = 1;
+        var mouseX = 0;
+        var mouseY = 0;
+
+        var socket = io();
+        socket.on('connect', function() {
+            socket.emit('my event', {data: 'I\'m connected!'});
+            socket.emit('user');
+        });
+
+        document.getElementById('prompt').value = "base";
 
         function toggleDropdown() {
             var dropdownContent = document.getElementById("dropdownContent");
             dropdownContent.style.display = dropdownContent.style.display === "block" ? "none" : "block";
-        }
+            
+          }
 
-        // socket.emit('join', {sid: '{{ request.sid }}'});
-
-        function selectOption(option) {
-            var selectedOption = document.querySelector(".selected-option");
-            selectedOption.textContent = option;
-            toggleDropdown();
-        }
-
-        function sendMessage() {
-
-          const timestamp = new Date().toLocaleString('en-US', { hour: 'numeric', minute: 'numeric', hour12: true });
-          const message = {
-            sender: "You",
-            text: "what ever text",
-            timestamp,
-          };
-
-          chatMessages.innerHTML += createChatMessageElement(message);
+        const sendMessage = () => {
+          // e.preventDefault()
           
+          console.log("HERE");
+          const timestamp = new Date().toLocaleString('en-US', { hour: 'numeric', minute: 'numeric', hour12: true })
+          const message = {
+            sender: messageSender,
+            text: document.getElementById('textBox').value,
+            timestamp,
+          }
+
+          var text = message.text;
+
+          /* Add message to DOM */
+          chatMessages.innerHTML += createChatMessageElement(message)
 
           const message2 = {
             sender: "Model",
             text: "",
             timestamp,
           };
+
           chatMessages.innerHTML += createChatMessageElement(message2);
-          document.getElementById('loading').style.display = "block";
-          socket.emit("query", message);
+
+          console.log("Trying to send query!")
+          socket.emit('query', {'query': text, 'prompt': document.getElementById("prompt").value, 'altprompt': document.getElementById('textBox2').value});
+          /* Save message to local storage */
+          // messages.push(message)
+          // localStorage.setItem('messages', JSON.stringify(messages))
+
+          /* Clear input field */
+          document.getElementById('textBox').value = "";
+
+          /*  Scroll to bottom of chat messages */
+
+          messageContainer.scrollTop = messageContainer.scrollHeight
+
+          // document.getElementById('textBox2').value = "";
         }
 
-        function trial() {
-          var text = "Message ";
-          const lastMessageElement = chatMessages.lastElementChild;
+        chatInputForm.addEventListener('submit', sendMessage)
+        // socket.emit('join', {sid: '{{ request.sid }}'});
 
-          if (lastMessageElement) {
-            const messageTextElement = lastMessageElement.querySelector('.message-text');
-            if (messageTextElement) {
-              messageTextElement.textContent = messageTextElement.textContent + text;
-              // lastMessageElement.querySelector('.message-timestamp').textContent = timestamp;
-            }
+        function samplePrompts(i) {
+          document.getElementById('textBox').value = "";
+          document.getElementById('textBox2').value = "";
+
+          document.getElementById('chatInput2').style.display = "none";
+
+          if (i == 1)
+          {
+            document.getElementById('prompt').value = "base";
           }
-          /*  Scroll to bottom of chat messages */
-          messageContainer.scrollTop = messageContainer.scrollHeight;
+          else if (i == 2)
+          {
+            document.getElementById('prompt').value = "json";
+            document.getElementById('chatInput2').style.display = "block";
+          }
+          else if (i == 3)
+          {
+            document.getElementById('prompt').value = "summarize";
+          }
+          else if (i == 4)
+          {
+            document.getElementById('prompt').value = "cypher";
+          }
+          else if (i == 5)
+          {
+            document.getElementById('prompt').value = "base";
+          }
         }
 
-        socket.on('tokens', function(data) {
-          const lastMessageElement = chatMessages.lastElementChild;
+        function selectOption(option) {
+            var selectedOption = document.querySelector(".selected-option");
+            selectedOption.textContent = option;
+            toggleDropdown();
+        }
+        socket.on('makeOutput', function(data) {
 
-          if (lastMessageElement) {
-            const messageTextElement = lastMessageElement.querySelector('.message-text');
-            if (messageTextElement) {
-              messageTextElement.textContent = messageTextElement.textContent + data['text'];
-              // lastMessageElement.querySelector('.message-timestamp').textContent = timestamp;
-            }
-          }
-          /*  Scroll to bottom of chat messages */
-          messageContainer.scrollTop = messageContainer.scrollHeight;
+          const timestamp = new Date().toLocaleString('en-US', { hour: 'numeric', minute: 'numeric', hour12: true });
+          const message = {
+            sender: "Model",
+            text: "",
+            timestamp,
+          };
+
+          chatMessages.innerHTML += createChatMessageElement(message);
+
         });
 
-        socket.on('finished', function(data) {
+        function updateMessage() {
+
+          const timestamp = new Date().toLocaleString('en-US', { hour: 'numeric', minute: 'numeric', hour12: true });
+          const message = {
+            sender: "Model",
+            text: "",
+            timestamp,
+          };
+
+          chatMessages.innerHTML += createChatMessageElement(message);
+
+        }
+
+        socket.on('message', function(data) {
           const lastMessageElement = chatMessages.lastElementChild;
 
           if (lastMessageElement) {
             const messageTextElement = lastMessageElement.querySelector('.message-text');
             if (messageTextElement) {
+              // messageTextElement.value = formatCode(messageTextElement.textContent + data.text);
               messageTextElement.innerHTML = formatCode(messageTextElement.innerHTML + data.text);
-              const codeElement = messageTextElement.querySelector('pre code');
-              if (codeElement) {
-                console.log("CODE");
-                console.log(data.text);
-                hljs.highlightElement(codeElement);
-              }
+              
+              const codeElements = messageTextElement.querySelectorAll('pre code');
+              codeElements.forEach((element) => {
+                hljs.highlightElement(element);
+              });
               // lastMessageElement.querySelector('.message-timestamp').textContent = timestamp;
             }
           }
+
           /*  Scroll to bottom of chat messages */
           messageContainer.scrollTop = messageContainer.scrollHeight;
-          document.getElementById('loading').style.display = "none";
+            // var codeStuff = document.querySelectorAll('pre code');
+            // codeStuff.forEach((block) => {
+            //   hljs.highlightElement(block);
+            // });
         });
+
+        document.addEventListener('mousemove', function(event) {
+            mouseX = event.clientX;
+            mouseY = event.clientY;
+        });
+        function copyText(text)
+        {
+          var decodedCode = decodeURIComponent(text);
+          navigator.clipboard.writeText(decodedCode);
+          
+          var popup = document.createElement('div');
+          popup.className = 'copypopup-message';
+          popup.textContent = 'Copied!';
+
+          // Set the position of the popup to the cursor position
+          popup.style.left = mouseX + 'px';
+          popup.style.top = mouseY + 'px';
+
+          // Append the popup message to the body
+          document.body.appendChild(popup);
+
+          // Fade out the popup after a delay
+          setTimeout(function() {
+              popup.style.opacity = 0;
+              setTimeout(function() {
+                  document.body.removeChild(popup);
+              }, 1000); // Fade out duration
+          }, 2000); // Popup display duration
+
+          console.log(mouseX);
+          console.log(mouseY);
+        }
 
         function formatCode(text) {
           // Regular expression to match code snippets within the text
           const codeRegex = /```([^`]+)```/g;
-          const newhtml = `
-          <div class="border-[0.5px] border-token-border-medium">
-          <div class="flex items-center relative text-token-text-secondary bg-token-main-surface-secondary px-4 py-2 text-xs font-sans justify-between rounded-t-md">
-            <span>code</span>
-            <div class="flex items-center">
-              <span class="" data-state="closed">
-                <button class="flex gap-1 items-center cButton">
-                  <svg width="24" height="24" fill="none" viewBox="0 0 24 24" class="icon-sm">
-                    <path fill="currentColor" fill-rule="evenodd" d="M7 5a3 3 0 0 1 3-3h9a3 3 0 0 1 3 3v9a3 3 0 0 1-3 3h-2v2a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3v-9a3 3 0 0 1 3-3h2zm2 2h5a3 3 0 0 1 3 3v5h2a1 1 0 0 0 1-1V5a1 1 0 0 0-1-1h-9a1 1 0 0 0-1 1zM5 9a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-9a1 1 0 0 0-1-1z" clip-rule="evenodd"></path>
-                  </svg>
-                  Copy code
-                </button>
-              </span>
-            </div>
-          </div>
-          <pre><code class="code">$1</code></pre>
-          </div>
-          `;
-          return text.replace(codeRegex, newhtml);
+          const matches = text.match(codeRegex);
+          if (matches != null)
+          {
+            matches.forEach((match) => 
+            {
+              const stuff = match.split("```")[1]
+              const language = stuff.split("\n")[0];
+              const code = stuff.substring(stuff.indexOf(language + "\n") + (language + "\n").length);
+
+              const newhtml = `
+                <div class="allCodeStuff">
+                  <div class="gray-banner">${language}
+                    <div class="copySection">
+                      <svg onclick="copyText('${encodeURIComponent(code)}')" width="24" height="100%" viewBox="0 0 24 24" xmlns="cheese">
+                        <path fill="#ffffff" d="M23 15H11.707l2.646 2.646-.707.707L9.793 14.5l3.854-3.854.707.707L11.707 14H23zm-13-5H6v1h4zm-4 5h2v-1H6zM3 4h3V3h3a2 2 0 0 1 4 0h3v1h3v9h-1V5h-2v2H6V5H4v16h14v-5h1v6H3zm4 2h8V4h-3V2.615A.615.615 0 0 0 11.386 2h-.771a.615.615 0 0 0-.615.615V4H7zM6 19h4v-1H6z"/>
+                        <path fill="none" d="M0 0h24v24H0z"/>
+                      </svg>
+                    </div>
+                  </div>
+                  <pre class=${language}><code class="code">${code}</code></pre>
+                </div>
+              `
+              text = text.replace(match, newhtml);
+            })
+          }
+          return text;
+        }
+
+        function showErrorBanner() {
+          const timestamp = new Date().toLocaleString('en-US', { hour: 'numeric', minute: 'numeric', hour12: true });
+          const message = {
+            sender: "Model",
+            text: "Positive Prompt: hello there",
+            timestamp,
+            path: "static/Dog" + value.toString() + ".jpg",
+          };
+
+          console.log(message)
+
+          chatMessages.innerHTML += createImageElement(message);
+          value = value + 1;
         }
         // setInterval(trial, 1000);
     </script>
