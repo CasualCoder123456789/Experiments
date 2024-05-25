@@ -1,14 +1,75 @@
+.gray-banner {
+    position: relative;
+    background-color: rgb(95, 95, 95);
+    color: white; /* Optional: To make the text stand out */
+    padding: 0 5px; /* Optional: Add some padding */
+    text-align: center; /* Optional: Center the text */
+    font-size: 16px; /* Optional: Set the font size */
+    margin: 0;
+    margin-top: 5px;
+    border-top-left-radius: 5px; /* Curved top-left corner */
+    border-top-right-radius: 5px; /* Curved top-right corner */
+    border-bottom-left-radius: 0; /* Square bottom-left corner */
+    border-bottom-right-radius: 0; /* Square bottom-right corner */
+    display: flex;
+    height: 1.5em;
+    justify-content: space-between;
+  }
+
+.copySection {
+    position: absolute; /* Position absolutely */
+    top: 50%; /* Align to the middle vertically */
+    right: 10px; /* 10px from the right edge */
+    transform: translateY(-50%); /* Adjust for vertical alignment */
+    align-items: center;
+    cursor: pointer;
+    /* cursor: url('Dog1small.jpg') 10 10, auto; */
+}
+
+.copypopup-message {
+    position: fixed;
+    top: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    background-color: rgba(0, 0, 0, 0.8);
+    color: #ffffff;
+    padding: 10px 20px;
+    border-radius: 5px;
+    z-index: 9999;
+    transition: opacity 0.5s ease;
+}
+
+.copypopup-message.fade-out {
+    opacity: 0;
+}
+
+.copySection svg {
+    margin-right: 0; /* Add some spacing between text and icon */
+  }
+
+pre {
+    margin: 0; /* Remove margin */
+    padding: 0; /* Remove padding */
+}
+
 pre code.hljs
 {
     display:block;
     overflow-x:auto;
     /* padding:1em; */
-    /* border-radius: 10px; */
+    padding: 5px 5px;
+    border-top-left-radius: 0; /* Curved top-left corner */
+    border-top-right-radius: 0; /* Curved top-right corner */
+    border-bottom-left-radius: 5px; /* Square bottom-left corner */
+    border-bottom-right-radius: 5px; /* Square bottom-right corner */
+    margin: 0;
+    margin-bottom: 5px;
 }
 
 code.hljs{
-    padding:3px 5px
+    padding: 5px 5px
 }
+
 .hljs-comment,
 .hljs-quote
 {
@@ -70,3 +131,4 @@ code.hljs{
 .hljs-strong{
     font-weight:700;
 }
+
