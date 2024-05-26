@@ -329,6 +329,28 @@
           value = value + 1;
         }
         // setInterval(trial, 1000);
+        var widthToggle = 0;
+        function toggleWidth()
+        {
+          const elements = document.querySelectorAll('.chat-messages');
+          var width = "100%";
+          if (widthToggle == 0)
+          {
+            width = "50%";
+          }
+          widthToggle = 1;
+          elements.forEach(element => 
+            {
+              element.style.width = width;
+            }
+          );
+          const stylecorrection = document.createElement('style');
+          stylecorrection.innerHTML = `
+          .chat-messages{
+            width: ${width};
+          }
+          `
+        }
     </script>
 
 {% endblock %}
