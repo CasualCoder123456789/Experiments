@@ -228,15 +228,18 @@
 
           if (lastMessageElement) {
             const messageTextElement = lastMessageElement.querySelector('.message-text');
+            if (! messageTextElement.value)
+            {
+              messageTextElement.value = "";
+            }
             if (messageTextElement) {
-              // messageTextElement.value = formatCode(messageTextElement.textContent + data.text);
-              messageTextElement.innerHTML = formatCode(messageTextElement.innerHTML + data.text);
-              
+              messageTextElement.value = messageTextElement.value + data.text;
+              messageTextElement.innerHTML = formatCode(messageTextElement.value);
+              // lastMessageElement.querySelector('.message-timestamp').textContent = timestamp;
               const codeElements = messageTextElement.querySelectorAll('pre code');
               codeElements.forEach((element) => {
                 hljs.highlightElement(element);
               });
-              // lastMessageElement.querySelector('.message-timestamp').textContent = timestamp;
             }
           }
 
@@ -282,7 +285,7 @@
 
         function formatCode(text) {
           // Regular expression to match code snippets within the text
-          const codeRegex = /```([^`]+)```/g;
+          const codeRegex = /```([^`]+)`?`?`?/g;
           const matches = text.match(codeRegex);
           if (matches != null)
           {
