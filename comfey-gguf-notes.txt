@@ -1,0 +1,1627 @@
+requirements.txt
+gguf>=0.9.1
+numpy<2.0.0
+####
+ops.py
+# (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
+import gguf
+import torch
+
+import comfy.ops
+import comfy.model_management
+from .dequant import dequantize_tensor, is_quantized
+
+class GGMLTensor(torch.Tensor):
+    """
+    Main tensor-like class for storing quantized weights
+    """
+    def __init__(self, *args, tensor_type, tensor_shape, patches=[], **kwargs):
+        super().__init__()
+        self.tensor_type = tensor_type
+        self.tensor_shape = tensor_shape
+        self.patches = patches
+
+    def __new__(cls, *args, tensor_type, tensor_shape, patches=[], **kwargs):
+        return super().__new__(cls, *args, **kwargs)
+
+    def to(self, *args, **kwargs):
+        new = super().to(*args, **kwargs)
+        new.tensor_type = getattr(self, "tensor_type", None)
+        new.tensor_shape = getattr(self, "tensor_shape", new.data.shape)
+        new.patches = getattr(self, "patches", []).copy()
+        return new
+
+    def clone(self, *args, **kwargs):
+        return self
+
+    def detach(self, *args, **kwargs):
+        return self
+
+    def copy_(self, *args, **kwargs):
+        # fixes .weight.copy_ in comfy/clip_model/CLIPTextModel
+        try:
+            return super().copy_(*args, **kwargs)
+        except Exception as e:
+            print(f"ignoring 'copy_' on tensor: {e}")
+
+    def __deepcopy__(self, *args, **kwargs):
+        # Intel Arc fix, ref#50
+        new = super().__deepcopy__(*args, **kwargs)
+        new.tensor_type = getattr(self, "tensor_type", None)
+        new.tensor_shape = getattr(self, "tensor_shape", new.data.shape)
+        new.patches = getattr(self, "patches", []).copy()
+        return new
+
+    @property
+    def shape(self):
+        if not hasattr(self, "tensor_shape"):
+            self.tensor_shape = self.size()
+        return self.tensor_shape
+
+class GGMLLayer(torch.nn.Module):
+    """
+    This (should) be responsible for de-quantizing on the fly
+    """
+    comfy_cast_weights = True
+    dequant_dtype = None
+    patch_dtype = None
+    torch_compatible_tensor_types = {None, gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}
+
+    def is_ggml_quantized(self, *, weight=None, bias=None):
+        if weight is None:
+            weight = self.weight
+        if bias is None:
+            bias = self.bias
+        return is_quantized(weight) or is_quantized(bias)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        weight, bias = state_dict.get(f"{prefix}weight"), state_dict.get(f"{prefix}bias")
+        # NOTE: using modified load for linear due to not initializing on creation, see GGMLOps todo 
+        if self.is_ggml_quantized(weight=weight, bias=bias) or isinstance(self, torch.nn.Linear):
+            return self.ggml_load_from_state_dict(state_dict, prefix, *args, **kwargs)
+        return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    def ggml_load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        prefix_len = len(prefix)
+        for k,v in state_dict.items():
+            if k[prefix_len:] == "weight":
+                self.weight = torch.nn.Parameter(v, requires_grad=False)
+            elif k[prefix_len:] == "bias" and v is not None:
+                self.bias = torch.nn.Parameter(v, requires_grad=False)
+            else:
+                missing_keys.append(k)
+
+    def _save_to_state_dict(self, *args, **kwargs):
+        if self.is_ggml_quantized():
+            return self.ggml_save_to_state_dict(*args, **kwargs)
+        return super()._save_to_state_dict(*args, **kwargs)
+
+    def ggml_save_to_state_dict(self, destination, prefix, keep_vars):
+        # This is a fake state dict for vram estimation
+        weight = torch.zeros_like(self.weight, device=torch.device("meta"))
+        destination[prefix + "weight"] = weight
+        if self.bias is not None:
+            bias = torch.zeros_like(self.bias, device=torch.device("meta"))
+            destination[prefix + "bias"] = bias
+        return
+
+        # This would return the actual state dict
+        destination[prefix + "weight"] = self.get_weight(self.weight)
+        if bias is not None:
+            destination[prefix + "bias"] = self.get_weight(self.bias)
+
+    def get_weight(self, tensor, dtype):
+        if tensor is None:
+            return
+
+        # consolidate and load patches to GPU in async
+        patch_list = []
+        device = tensor.device
+        for function, patches, key in getattr(tensor, "patches", []):
+            patch_list += move_patch_to_device(patches, device)
+
+        # dequantize tensor while patches load
+        weight = dequantize_tensor(tensor, dtype, self.dequant_dtype)
+
+        # apply patches
+        if patch_list:
+            if self.patch_dtype is None:
+                weight = function(patch_list, weight, key)
+            else:
+                # for testing, may degrade image quality
+                patch_dtype = dtype if self.patch_dtype == "target" else self.patch_dtype
+                weight = function(patch_list, weight, key, patch_dtype)
+        return weight
+
+    def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None):
+        if input is not None:
+            if dtype is None:
+                dtype = getattr(input, "dtype", torch.float32)
+            if bias_dtype is None:
+                bias_dtype = dtype
+            if device is None:
+                device = input.device
+
+        bias = None
+        non_blocking = comfy.model_management.device_supports_non_blocking(device)
+        if s.bias is not None:
+            bias = s.get_weight(s.bias.to(device), dtype)
+            bias = comfy.ops.cast_to(bias, bias_dtype, device, non_blocking=non_blocking, copy=False)
+
+        weight = s.get_weight(s.weight.to(device), dtype)
+        weight = comfy.ops.cast_to(weight, dtype, device, non_blocking=non_blocking, copy=False)
+        return weight, bias
+
+    def forward_comfy_cast_weights(self, input, *args, **kwargs):
+        if self.is_ggml_quantized():
+            return self.forward_ggml_cast_weights(input, *args, **kwargs)
+        return super().forward_comfy_cast_weights(input, *args, **kwargs)
+
+    def forward_ggml_cast_weights(self, input):
+        raise NotImplementedError
+
+class GGMLOps(comfy.ops.manual_cast):
+    """
+    Dequantize weights on the fly before doing the compute
+    """
+    class Linear(GGMLLayer, comfy.ops.manual_cast.Linear):
+        def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
+            torch.nn.Module.__init__(self)
+            # TODO: better workaround for reserved memory spike on windows
+            # Issue is with `torch.empty` still reserving the full memory for the layer
+            # Windows doesn't over-commit memory so without this 24GB+ of pagefile is used
+            self.in_features = in_features
+            self.out_features = out_features
+            self.weight = None
+            self.bias = None
+
+        def forward_ggml_cast_weights(self, input):
+            weight, bias = self.cast_bias_weight(input)
+            return torch.nn.functional.linear(input, weight, bias)
+
+    class Conv2d(GGMLLayer, comfy.ops.manual_cast.Conv2d):
+        def forward_ggml_cast_weights(self, input):
+            weight, bias = self.cast_bias_weight(input)
+            return self._conv_forward(input, weight, bias)
+
+    class Embedding(GGMLLayer, comfy.ops.manual_cast.Embedding):
+        def forward_ggml_cast_weights(self, input, out_dtype=None):
+            output_dtype = out_dtype
+            if self.weight.dtype == torch.float16 or self.weight.dtype == torch.bfloat16:
+                out_dtype = None
+            weight, _bias = self.cast_bias_weight(self, device=input.device, dtype=out_dtype)
+            return torch.nn.functional.embedding(
+                input, weight, self.padding_idx, self.max_norm, self.norm_type, self.scale_grad_by_freq, self.sparse
+            ).to(dtype=output_dtype)
+
+    class LayerNorm(GGMLLayer, comfy.ops.manual_cast.LayerNorm):
+        def forward_ggml_cast_weights(self, input):
+            if self.weight is None:
+                return super().forward_comfy_cast_weights(input)
+            weight, bias = self.cast_bias_weight(input)
+            return torch.nn.functional.layer_norm(input, self.normalized_shape, weight, bias, self.eps)
+
+    class GroupNorm(GGMLLayer, comfy.ops.manual_cast.GroupNorm):
+        def forward_ggml_cast_weights(self, input):
+            weight, bias = self.cast_bias_weight(input)
+            return torch.nn.functional.group_norm(input, self.num_groups, weight, bias, self.eps)
+
+def move_patch_to_device(item, device):
+    if isinstance(item, torch.Tensor):
+        return item.to(device, non_blocking=True)
+    elif isinstance(item, tuple):
+        return tuple(move_patch_to_device(x, device) for x in item)
+    elif isinstance(item, list):
+        return [move_patch_to_device(x, device) for x in item]
+    else:
+        return item
+####
+nodes.py
+# (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
+import torch
+import gguf
+import copy
+import logging
+
+import comfy.sd
+import comfy.utils
+import comfy.model_management
+import comfy.model_patcher
+import folder_paths
+
+from .ops import GGMLTensor, GGMLOps, move_patch_to_device
+from .dequant import is_quantized, is_torch_compatible
+
+# Add a custom keys for files ending in .gguf
+if "unet_gguf" not in folder_paths.folder_names_and_paths:
+    orig = folder_paths.folder_names_and_paths.get("diffusion_models", folder_paths.folder_names_and_paths.get("unet", [[], set()]))
+    folder_paths.folder_names_and_paths["unet_gguf"] = (orig[0], {".gguf"})
+
+if "clip_gguf" not in folder_paths.folder_names_and_paths:
+    orig = folder_paths.folder_names_and_paths.get("clip", [[], set()])
+    folder_paths.folder_names_and_paths["clip_gguf"] = (orig[0], {".gguf"})
+
+def gguf_sd_loader_get_orig_shape(reader, tensor_name):
+    field_key = f"comfy.gguf.orig_shape.{tensor_name}"
+    field = reader.get_field(field_key)
+    if field is None:
+        return None
+    # Has original shape metadata, so we try to decode it.
+    if len(field.types) != 2 or field.types[0] != gguf.GGUFValueType.ARRAY or field.types[1] != gguf.GGUFValueType.INT32:
+        raise TypeError(f"Bad original shape metadata for {field_key}: Expected ARRAY of INT32, got {field.types}")
+    return torch.Size(tuple(int(field.parts[part_idx][0]) for part_idx in field.data))
+
+def gguf_sd_loader(path, handle_prefix="model.diffusion_model."):
+    """
+    Read state dict as fake tensors
+    """
+    reader = gguf.GGUFReader(path)
+
+    # filter and strip prefix
+    has_prefix = False
+    if handle_prefix is not None:
+        prefix_len = len(handle_prefix)
+        tensor_names = set(tensor.name for tensor in reader.tensors)
+        has_prefix = any(s.startswith(handle_prefix) for s in tensor_names)
+
+    tensors = []
+    for tensor in reader.tensors:
+        sd_key = tensor_name = tensor.name
+        if has_prefix:
+            if not tensor_name.startswith(handle_prefix):
+                continue
+            sd_key = tensor_name[prefix_len:]
+        tensors.append((sd_key, tensor))
+
+    # detect and verify architecture
+    compat = None
+    arch_str = None
+    arch_field = reader.get_field("general.architecture")
+    if arch_field is not None:
+        if len(arch_field.types) != 1 or arch_field.types[0] != gguf.GGUFValueType.STRING:
+            raise TypeError(f"Bad type for GGUF general.architecture key: expected string, got {arch_field.types!r}")
+        arch_str = str(arch_field.parts[arch_field.data[-1]], encoding="utf-8")
+        if arch_str not in {"flux", "sd1", "sdxl", "t5", "t5encoder"}:
+            raise ValueError(f"Unexpected architecture type in GGUF file, expected one of flux, sd1, sdxl, t5encoder but got {arch_str!r}")
+    else: # stable-diffusion.cpp
+        # import here to avoid changes to convert.py breaking regular models
+        from .tools.convert import detect_arch
+        arch_str = detect_arch(set(val[0] for val in tensors))
+        compat = "sd.cpp"
+
+    # main loading loop
+    state_dict = {}
+    qtype_dict = {}
+    for sd_key, tensor in tensors:
+        tensor_name = tensor.name
+        tensor_type_str = str(tensor.tensor_type)
+        torch_tensor = torch.from_numpy(tensor.data) # mmap
+
+        shape = gguf_sd_loader_get_orig_shape(reader, tensor_name)
+        if shape is None:
+            shape = torch.Size(tuple(int(v) for v in reversed(tensor.shape)))
+            # Workaround for stable-diffusion.cpp SDXL detection.
+            if compat == "sd.cpp" and arch_str == "sdxl":
+                if any([tensor_name.endswith(x) for x in (".proj_in.weight", ".proj_out.weight")]):
+                    while len(shape) > 2 and shape[-1] == 1:
+                        shape = shape[:-1]
+
+        # add to state dict
+        if tensor.tensor_type in {gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}:
+            torch_tensor = torch_tensor.view(*shape)
+        state_dict[sd_key] = GGMLTensor(torch_tensor, tensor_type=tensor.tensor_type, tensor_shape=shape)
+        qtype_dict[tensor_type_str] = qtype_dict.get(tensor_type_str, 0) + 1
+
+    # sanity check debug print
+    print("\nggml_sd_loader:")
+    for k,v in qtype_dict.items():
+        print(f" {k:30}{v:3}")
+
+    return state_dict
+
+# for remapping llama.cpp -> original key names
+clip_sd_map = {
+    "enc.": "encoder.",
+    ".blk.": ".block.",
+    "token_embd": "shared",
+    "output_norm": "final_layer_norm",
+    "attn_q": "layer.0.SelfAttention.q",
+    "attn_k": "layer.0.SelfAttention.k",
+    "attn_v": "layer.0.SelfAttention.v",
+    "attn_o": "layer.0.SelfAttention.o",
+    "attn_norm": "layer.0.layer_norm",
+    "attn_rel_b": "layer.0.SelfAttention.relative_attention_bias",
+    "ffn_up": "layer.1.DenseReluDense.wi_1",
+    "ffn_down": "layer.1.DenseReluDense.wo",
+    "ffn_gate": "layer.1.DenseReluDense.wi_0",
+    "ffn_norm": "layer.1.layer_norm",
+}
+
+def gguf_clip_loader(path):
+    raw_sd = gguf_sd_loader(path)
+    assert "enc.blk.23.ffn_up.weight" in raw_sd, "Invalid Text Encoder!"
+    sd = {}
+    for k,v in raw_sd.items():
+        for s,d in clip_sd_map.items():
+            k = k.replace(s,d)
+        sd[k] = v
+    return sd
+
+# TODO: Temporary fix for now
+import collections
+class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
+    patch_on_device = False
+
+    def patch_weight_to_device(self, key, device_to=None, inplace_update=False):
+        if key not in self.patches:
+            return
+        weight = comfy.utils.get_attr(self.model, key)
+
+        try:
+            from comfy.lora import calculate_weight
+        except Exception:
+            calculate_weight = self.calculate_weight
+
+        patches = self.patches[key]
+        if is_quantized(weight):
+            out_weight = weight.to(device_to)
+            patches = move_patch_to_device(patches, self.load_device if self.patch_on_device else self.offload_device)
+            # TODO: do we ever have legitimate duplicate patches? (i.e. patch on top of patched weight)
+            out_weight.patches = [(calculate_weight, patches, key)]
+        else:
+            inplace_update = self.weight_inplace_update or inplace_update
+            if key not in self.backup:
+                self.backup[key] = collections.namedtuple('Dimension', ['weight', 'inplace_update'])(
+                    weight.to(device=self.offload_device, copy=inplace_update), inplace_update
+                )
+
+            if device_to is not None:
+                temp_weight = comfy.model_management.cast_to_device(weight, device_to, torch.float32, copy=True)
+            else:
+                temp_weight = weight.to(torch.float32, copy=True)
+
+            out_weight = calculate_weight(patches, temp_weight, key)
+            out_weight = comfy.float.stochastic_rounding(out_weight, weight.dtype)
+
+        if inplace_update:
+            comfy.utils.copy_to_param(self.model, key, out_weight)
+        else:
+            comfy.utils.set_attr_param(self.model, key, out_weight)
+
+    def unpatch_model(self, device_to=None, unpatch_weights=True):
+        if unpatch_weights:
+            for p in self.model.parameters():
+                if is_torch_compatible(p):
+                    continue
+                patches = getattr(p, "patches", [])
+                if len(patches) > 0:
+                    p.patches = []
+        # TODO: Find another way to not unload after patches
+        return super().unpatch_model(device_to=device_to, unpatch_weights=unpatch_weights)
+
+    mmap_released = False
+    def load(self, *args, force_patch_weights=False, **kwargs):
+        # always call `patch_weight_to_device` even for lowvram
+        super().load(*args, force_patch_weights=True, **kwargs)
+
+        # make sure nothing stays linked to mmap after first load
+        if not self.mmap_released:
+            linked = []
+            if kwargs.get("lowvram_model_memory", 0) > 0:
+                for n, m in self.model.named_modules():
+                    if hasattr(m, "weight"):
+                        device = getattr(m.weight, "device", None)
+                        if device == self.offload_device:
+                            linked.append((n, m))
+                            continue
+                    if hasattr(m, "bias"):
+                        device = getattr(m.bias, "device", None)
+                        if device == self.offload_device:
+                            linked.append((n, m))
+                            continue
+            if linked:
+                print(f"Attempting to release mmap ({len(linked)})")
+                for n, m in linked:
+                    # TODO: possible to OOM, find better way to detach
+                    m.to(self.load_device).to(self.offload_device)
+            self.mmap_released = True
+
+    def clone(self, *args, **kwargs):
+        n = GGUFModelPatcher(self.model, self.load_device, self.offload_device, self.size, weight_inplace_update=self.weight_inplace_update)
+        n.patches = {}
+        for k in self.patches:
+            n.patches[k] = self.patches[k][:]
+        n.patches_uuid = self.patches_uuid
+
+        n.object_patches = self.object_patches.copy()
+        n.model_options = copy.deepcopy(self.model_options)
+        n.backup = self.backup
+        n.object_patches_backup = self.object_patches_backup
+        n.patch_on_device = getattr(self, "patch_on_device", False)
+        return n
+
+class UnetLoaderGGUF:
+    @classmethod
+    def INPUT_TYPES(s):
+        unet_names = [x for x in folder_paths.get_filename_list("unet_gguf")]
+        return {
+            "required": {
+                "unet_name": (unet_names,),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "load_unet"
+    CATEGORY = "bootleg"
+    TITLE = "Unet Loader (GGUF)"
+
+    def load_unet(self, unet_name, dequant_dtype=None, patch_dtype=None, patch_on_device=None):
+        ops = GGMLOps()
+
+        if dequant_dtype in ("default", None):
+            ops.Linear.dequant_dtype = None
+        elif dequant_dtype in ["target"]:
+            ops.Linear.dequant_dtype = dequant_dtype
+        else:
+            ops.Linear.dequant_dtype = getattr(torch, dequant_dtype)
+
+        if patch_dtype in ("default", None):
+            ops.Linear.patch_dtype = None
+        elif patch_dtype in ["target"]:
+            ops.Linear.patch_dtype = patch_dtype
+        else:
+            ops.Linear.patch_dtype = getattr(torch, patch_dtype)
+
+        # init model
+        unet_path = folder_paths.get_full_path("unet", unet_name)
+        sd = gguf_sd_loader(unet_path)
+        model = comfy.sd.load_diffusion_model_state_dict(
+            sd, model_options={"custom_operations": ops}
+        )
+        if model is None:
+            logging.error("ERROR UNSUPPORTED UNET {}".format(unet_path))
+            raise RuntimeError("ERROR: Could not detect model type of: {}".format(unet_path))
+        model = GGUFModelPatcher.clone(model)
+        model.patch_on_device = patch_on_device
+        return (model,)
+
+class UnetLoaderGGUFAdvanced(UnetLoaderGGUF):
+    @classmethod
+    def INPUT_TYPES(s):
+        unet_names = [x for x in folder_paths.get_filename_list("unet_gguf")]
+        return {
+            "required": {
+                "unet_name": (unet_names,),
+                "dequant_dtype": (["default", "target", "float32", "float16", "bfloat16"], {"default": "default"}),
+                "patch_dtype": (["default", "target", "float32", "float16", "bfloat16"], {"default": "default"}),
+                "patch_on_device": ("BOOLEAN", {"default": False}),
+            }
+        }
+    TITLE = "Unet Loader (GGUF/Advanced)"
+
+clip_name_dict = {
+    "stable_diffusion": comfy.sd.CLIPType.STABLE_DIFFUSION,
+    "stable_cascade": comfy.sd.CLIPType.STABLE_CASCADE,
+    "stable_audio": comfy.sd.CLIPType.STABLE_AUDIO,
+    "sdxl": comfy.sd.CLIPType.STABLE_DIFFUSION,
+    "sd3": comfy.sd.CLIPType.SD3,
+    "flux": comfy.sd.CLIPType.FLUX,
+}
+
+class CLIPLoaderGGUF:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "clip_name": (s.get_filename_list(),),
+                "type": (["stable_diffusion", "stable_cascade", "sd3", "stable_audio"],),
+            }
+        }
+
+    RETURN_TYPES = ("CLIP",)
+    FUNCTION = "load_clip"
+    CATEGORY = "bootleg"
+    TITLE = "CLIPLoader (GGUF)"
+
+    @classmethod
+    def get_filename_list(s):
+        files = []
+        files += folder_paths.get_filename_list("clip")
+        files += folder_paths.get_filename_list("clip_gguf")
+        return sorted(files)
+
+    def load_data(self, ckpt_paths):
+        clip_data = []
+        for p in ckpt_paths:
+            if p.endswith(".gguf"):
+                clip_data.append(gguf_clip_loader(p))
+            else:
+                sd = comfy.utils.load_torch_file(p, safe_load=True)
+                clip_data.append(
+                    {k:GGMLTensor(v, tensor_type=gguf.GGMLQuantizationType.F16, tensor_shape=v.shape) for k,v in sd.items()}
+                )
+        return clip_data
+
+    def load_patcher(self, clip_paths, clip_type, clip_data):
+        clip = comfy.sd.load_text_encoder_state_dicts(
+            clip_type = clip_type,
+            state_dicts = clip_data,
+            model_options = {"custom_operations": GGMLOps},
+            embedding_directory = folder_paths.get_folder_paths("embeddings"),
+        )
+        clip.patcher = GGUFModelPatcher.clone(clip.patcher)
+
+        # for some reason this is just missing in some SAI checkpoints
+        if getattr(clip.cond_stage_model, "clip_l", None) is not None:
+            if getattr(clip.cond_stage_model.clip_l.transformer.text_projection.weight, "tensor_shape", None) is None:
+                clip.cond_stage_model.clip_l.transformer.text_projection = comfy.ops.manual_cast.Linear(768, 768)
+        if getattr(clip.cond_stage_model, "clip_g", None) is not None:
+            if getattr(clip.cond_stage_model.clip_g.transformer.text_projection.weight, "tensor_shape", None) is None:
+                clip.cond_stage_model.clip_g.transformer.text_projection = comfy.ops.manual_cast.Linear(1280, 1280)
+
+        return clip
+
+    def load_clip(self, clip_name, type="stable_diffusion"):
+        clip_path = folder_paths.get_full_path("clip", clip_name)
+        clip_type = clip_name_dict.get(type, comfy.sd.CLIPType.STABLE_DIFFUSION)
+        return (self.load_patcher([clip_path], clip_type, self.load_data([clip_path])),)
+
+class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
+    @classmethod
+    def INPUT_TYPES(s):
+        file_options = (s.get_filename_list(), )
+        return {
+            "required": {
+                "clip_name1": file_options,
+                "clip_name2": file_options,
+                "type": (("sdxl", "sd3", "flux"), ),
+            }
+        }
+
+    TITLE = "DualCLIPLoader (GGUF)"
+
+    def load_clip(self, clip_name1, clip_name2, type):
+        clip_path1 = folder_paths.get_full_path("clip", clip_name1)
+        clip_path2 = folder_paths.get_full_path("clip", clip_name2)
+        clip_paths = (clip_path1, clip_path2)
+        clip_type = clip_name_dict.get(type, comfy.sd.CLIPType.STABLE_DIFFUSION)
+        return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)
+
+class TripleCLIPLoaderGGUF(CLIPLoaderGGUF):
+    @classmethod
+    def INPUT_TYPES(s):
+        file_options = (s.get_filename_list(), )
+        return {
+            "required": {
+                "clip_name1": file_options,
+                "clip_name2": file_options,
+                "clip_name3": file_options,
+            }
+        }
+
+    TITLE = "TripleCLIPLoader (GGUF)"
+
+    def load_clip(self, clip_name1, clip_name2, clip_name3, type="sd3"):
+        clip_path1 = folder_paths.get_full_path("clip", clip_name1)
+        clip_path2 = folder_paths.get_full_path("clip", clip_name2)
+        clip_path3 = folder_paths.get_full_path("clip", clip_name3)
+        clip_paths = (clip_path1, clip_path2, clip_path3)
+        clip_type = clip_name_dict.get(type, comfy.sd.CLIPType.STABLE_DIFFUSION)
+        return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)
+
+NODE_CLASS_MAPPINGS = {
+    "UnetLoaderGGUF": UnetLoaderGGUF,
+    "CLIPLoaderGGUF": CLIPLoaderGGUF,
+    "DualCLIPLoaderGGUF": DualCLIPLoaderGGUF,
+    "TripleCLIPLoaderGGUF": TripleCLIPLoaderGGUF,
+    "UnetLoaderGGUFAdvanced": UnetLoaderGGUFAdvanced,
+}
+###
+dequant.py
+# (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
+import gguf
+import torch
+from tqdm import tqdm
+
+
+TORCH_COMPATIBLE_QTYPES = {None, gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}
+
+def is_torch_compatible(tensor):
+    return tensor is None or getattr(tensor, "tensor_type", None) in TORCH_COMPATIBLE_QTYPES
+
+def is_quantized(tensor):
+    return not is_torch_compatible(tensor)
+
+def dequantize_tensor(tensor, dtype=None, dequant_dtype=None):
+    qtype = getattr(tensor, "tensor_type", None)
+    oshape = getattr(tensor, "tensor_shape", tensor.shape)
+
+    if qtype in TORCH_COMPATIBLE_QTYPES:
+        return tensor.to(dtype)
+    elif qtype in dequantize_functions:
+        dequant_dtype = dtype if dequant_dtype == "target" else dequant_dtype
+        return dequantize(tensor.data, qtype, oshape, dtype=dequant_dtype).to(dtype)
+    else:
+        # this is incredibly slow
+        tqdm.write(f"Falling back to numpy dequant for qtype: {qtype}")
+        new = gguf.quants.dequantize(tensor.cpu().numpy(), qtype)
+        return torch.from_numpy(new).to(tensor.device, dtype=dtype)
+
+def dequantize(data, qtype, oshape, dtype=None):
+    """
+    Dequantize tensor back to usable shape/dtype
+    """
+    block_size, type_size = gguf.GGML_QUANT_SIZES[qtype]
+    dequantize_blocks = dequantize_functions[qtype]
+
+    rows = data.reshape(
+        (-1, data.shape[-1])
+    ).view(torch.uint8)
+
+    n_blocks = rows.numel() // type_size
+    blocks = rows.reshape((n_blocks, type_size))
+    blocks = dequantize_blocks(blocks, block_size, type_size, dtype)
+    return blocks.reshape(oshape)
+
+def to_uint32(x):
+    # no uint32 :(
+    x = x.view(torch.uint8).to(torch.int32)
+    return (x[:, 0] | x[:, 1] << 8 | x[:, 2] << 16 | x[:, 3] << 24).unsqueeze(1)
+
+def split_block_dims(blocks, *args):
+    n_max = blocks.shape[1]
+    dims = list(args) + [n_max - sum(args)]
+    return torch.split(blocks, dims, dim=1)
+
+# Full weights #
+def dequantize_blocks_BF16(blocks, block_size, type_size, dtype=None):
+    return (blocks.view(torch.int16).to(torch.int32) << 16).view(torch.float32)
+
+# Legacy Quants #
+def dequantize_blocks_Q8_0(blocks, block_size, type_size, dtype=None):
+    d, x = split_block_dims(blocks, 2)
+    d = d.view(torch.float16).to(dtype)
+    x = x.view(torch.int8)
+    return (d * x)
+
+def dequantize_blocks_Q5_1(blocks, block_size, type_size, dtype=None):
+    n_blocks = blocks.shape[0]
+
+    d, m, qh, qs = split_block_dims(blocks, 2, 2, 4)
+    d = d.view(torch.float16).to(dtype)
+    m = m.view(torch.float16).to(dtype)
+    qh = to_uint32(qh)
+
+    qh = qh.reshape((n_blocks, 1)) >> torch.arange(32, device=d.device, dtype=torch.int32).reshape(1, 32)
+    ql = qs.reshape((n_blocks, -1, 1, block_size // 2)) >> torch.tensor([0, 4], device=d.device, dtype=torch.uint8).reshape(1, 1, 2, 1)
+    qh = (qh & 1).to(torch.uint8)
+    ql = (ql & 0x0F).reshape((n_blocks, -1))
+
+    qs = (ql | (qh << 4))
+    return (d * qs) + m
+
+def dequantize_blocks_Q5_0(blocks, block_size, type_size, dtype=None):
+    n_blocks = blocks.shape[0]
+
+    d, qh, qs = split_block_dims(blocks, 2, 4)
+    d  = d.view(torch.float16).to(dtype)
+    qh = to_uint32(qh)
+
+    qh = qh.reshape(n_blocks, 1) >> torch.arange(32, device=d.device, dtype=torch.int32).reshape(1, 32)
+    ql = qs.reshape(n_blocks, -1, 1, block_size // 2) >> torch.tensor([0, 4], device=d.device, dtype=torch.uint8).reshape(1, 1, 2, 1)
+
+    qh = (qh & 1).to(torch.uint8)
+    ql = (ql & 0x0F).reshape(n_blocks, -1)
+
+    qs = (ql | (qh << 4)).to(torch.int8) - 16
+    return (d * qs)
+
+def dequantize_blocks_Q4_1(blocks, block_size, type_size, dtype=None):
+    n_blocks = blocks.shape[0]
+
+    d, m, qs = split_block_dims(blocks, 2, 2)
+    d = d.view(torch.float16).to(dtype)
+    m = m.view(torch.float16).to(dtype)
+
+    qs = qs.reshape((n_blocks, -1, 1, block_size // 2)) >> torch.tensor([0, 4], device=d.device, dtype=torch.uint8).reshape(1, 1, 2, 1)
+    qs = (qs & 0x0F).reshape(n_blocks, -1)
+
+    return (d * qs) + m
+
+def dequantize_blocks_Q4_0(blocks, block_size, type_size, dtype=None):
+    n_blocks = blocks.shape[0]
+
+    d, qs = split_block_dims(blocks, 2)
+    d  = d.view(torch.float16).to(dtype)
+
+    qs = qs.reshape((n_blocks, -1, 1, block_size // 2)) >> torch.tensor([0, 4], device=d.device, dtype=torch.uint8).reshape((1, 1, 2, 1))
+    qs = (qs & 0x0F).reshape((n_blocks, -1)).to(torch.int8) - 8
+    return (d * qs)
+
+# K Quants #
+QK_K = 256
+K_SCALE_SIZE = 12
+
+def get_scale_min(scales):
+    n_blocks = scales.shape[0]
+    scales = scales.view(torch.uint8)
+    scales = scales.reshape((n_blocks, 3, 4))
+
+    d, m, m_d = torch.split(scales, scales.shape[-2] // 3, dim=-2)
+
+    sc = torch.cat([d & 0x3F, (m_d & 0x0F) | ((d >> 2) & 0x30)], dim=-1)
+    min = torch.cat([m & 0x3F, (m_d >> 4) | ((m >> 2) & 0x30)], dim=-1)
+
+    return (sc.reshape((n_blocks, 8)), min.reshape((n_blocks, 8)))
+
+def dequantize_blocks_Q6_K(blocks, block_size, type_size, dtype=None):
+    n_blocks = blocks.shape[0]
+
+    ql, qh, scales, d, = split_block_dims(blocks, QK_K // 2, QK_K // 4, QK_K // 16)
+
+    scales = scales.view(torch.int8).to(dtype)
+    d = d.view(torch.float16).to(dtype)
+    d = (d * scales).reshape((n_blocks, QK_K // 16, 1))
+
+    ql = ql.reshape((n_blocks, -1, 1, 64)) >> torch.tensor([0, 4], device=d.device, dtype=torch.uint8).reshape((1, 1, 2, 1))
+    ql = (ql & 0x0F).reshape((n_blocks, -1, 32))
+    qh = qh.reshape((n_blocks, -1, 1, 32)) >> torch.tensor([0, 2, 4, 6], device=d.device, dtype=torch.uint8).reshape((1, 1, 4, 1))
+    qh = (qh & 0x03).reshape((n_blocks, -1, 32))
+    q = (ql | (qh << 4)).to(torch.int8) - 32
+    q = q.reshape((n_blocks, QK_K // 16, -1))
+
+    return (d * q).reshape((n_blocks, QK_K))
+
+def dequantize_blocks_Q5_K(blocks, block_size, type_size, dtype=None):
+    n_blocks = blocks.shape[0]
+
+    d, dmin, scales, qh, qs = split_block_dims(blocks, 2, 2, K_SCALE_SIZE, QK_K // 8)
+
+    d = d.view(torch.float16).to(dtype)
+    dmin = dmin.view(torch.float16).to(dtype)
+
+    sc, m = get_scale_min(scales)
+
+    d = (d * sc).reshape((n_blocks, -1, 1))
+    dm = (dmin * m).reshape((n_blocks, -1, 1))
+
+    ql = qs.reshape((n_blocks, -1, 1, 32)) >> torch.tensor([0, 4], device=d.device, dtype=torch.uint8).reshape((1, 1, 2, 1))
+    qh = qh.reshape((n_blocks, -1, 1, 32)) >> torch.tensor([i for i in range(8)], device=d.device, dtype=torch.uint8).reshape((1, 1, 8, 1))
+    ql = (ql & 0x0F).reshape((n_blocks, -1, 32))
+    qh = (qh & 0x01).reshape((n_blocks, -1, 32))
+    q = (ql | (qh << 4))
+
+    return (d * q - dm).reshape((n_blocks, QK_K))
+
+def dequantize_blocks_Q4_K(blocks, block_size, type_size, dtype=None):
+    n_blocks = blocks.shape[0]
+
+    d, dmin, scales, qs = split_block_dims(blocks, 2, 2, K_SCALE_SIZE)
+    d = d.view(torch.float16).to(dtype)
+    dmin = dmin.view(torch.float16).to(dtype)
+
+    sc, m = get_scale_min(scales)
+
+    d = (d * sc).reshape((n_blocks, -1, 1))
+    dm = (dmin * m).reshape((n_blocks, -1, 1))
+
+    qs = qs.reshape((n_blocks, -1, 1, 32)) >> torch.tensor([0, 4], device=d.device, dtype=torch.uint8).reshape((1, 1, 2, 1))
+    qs = (qs & 0x0F).reshape((n_blocks, -1, 32))
+
+    return (d * qs - dm).reshape((n_blocks, QK_K))
+
+def dequantize_blocks_Q3_K(blocks, block_size, type_size, dtype=None):
+    n_blocks = blocks.shape[0]
+
+    hmask, qs, scales, d = split_block_dims(blocks, QK_K // 8, QK_K // 4, 12)
+    d = d.view(torch.float16).to(dtype)
+
+    lscales, hscales = scales[:, :8], scales[:, 8:]
+    lscales = lscales.reshape((n_blocks, 1, 8)) >> torch.tensor([0, 4], device=d.device, dtype=torch.uint8).reshape((1, 2, 1))
+    lscales = lscales.reshape((n_blocks, 16))
+    hscales = hscales.reshape((n_blocks, 1, 4)) >> torch.tensor([0, 2, 4, 6], device=d.device, dtype=torch.uint8).reshape((1, 4, 1))
+    hscales = hscales.reshape((n_blocks, 16))
+    scales = (lscales & 0x0F) | ((hscales & 0x03) << 4)
+    scales = (scales.to(torch.int8) - 32)
+
+    dl = (d * scales).reshape((n_blocks, 16, 1))
+
+    ql = qs.reshape((n_blocks, -1, 1, 32)) >> torch.tensor([0, 2, 4, 6], device=d.device, dtype=torch.uint8).reshape((1, 1, 4, 1))
+    qh = hmask.reshape(n_blocks, -1, 1, 32) >> torch.tensor([i for i in range(8)], device=d.device, dtype=torch.uint8).reshape((1, 1, 8, 1))
+    ql = ql.reshape((n_blocks, 16, QK_K // 16)) & 3
+    qh = (qh.reshape((n_blocks, 16, QK_K // 16)) & 1) ^ 1
+    q = (ql.to(torch.int8) - (qh << 2).to(torch.int8))
+
+    return (dl * q).reshape((n_blocks, QK_K))
+
+def dequantize_blocks_Q2_K(blocks, block_size, type_size, dtype=None):
+    n_blocks = blocks.shape[0]
+
+    scales, qs, d, dmin = split_block_dims(blocks, QK_K // 16, QK_K // 4, 2)
+    d = d.view(torch.float16).to(dtype)
+    dmin = dmin.view(torch.float16).to(dtype)
+
+    # (n_blocks, 16, 1)
+    dl = (d * (scales & 0xF)).reshape((n_blocks, QK_K // 16, 1))
+    ml = (dmin * (scales >> 4)).reshape((n_blocks, QK_K // 16, 1))
+
+    shift = torch.tensor([0, 2, 4, 6], device=d.device, dtype=torch.uint8).reshape((1, 1, 4, 1))
+
+    qs = (qs.reshape((n_blocks, -1, 1, 32)) >> shift) & 3
+    qs = qs.reshape((n_blocks, QK_K // 16, 16))
+    qs = dl * qs - ml
+
+    return qs.reshape((n_blocks, -1))
+
+dequantize_functions = {
+    gguf.GGMLQuantizationType.BF16: dequantize_blocks_BF16,
+    gguf.GGMLQuantizationType.Q8_0: dequantize_blocks_Q8_0,
+    gguf.GGMLQuantizationType.Q5_1: dequantize_blocks_Q5_1,
+    gguf.GGMLQuantizationType.Q5_0: dequantize_blocks_Q5_0,
+    gguf.GGMLQuantizationType.Q4_1: dequantize_blocks_Q4_1,
+    gguf.GGMLQuantizationType.Q4_0: dequantize_blocks_Q4_0,
+    gguf.GGMLQuantizationType.Q6_K: dequantize_blocks_Q6_K,
+    gguf.GGMLQuantizationType.Q5_K: dequantize_blocks_Q5_K,
+    gguf.GGMLQuantizationType.Q4_K: dequantize_blocks_Q4_K,
+    gguf.GGMLQuantizationType.Q3_K: dequantize_blocks_Q3_K,
+    gguf.GGMLQuantizationType.Q2_K: dequantize_blocks_Q2_K,
+}
+#####
+__init__.py
+# only import if running as a custom node
+try:
+    import comfy.utils
+except ImportError:
+    pass
+else:
+    from .nodes import NODE_CLASS_MAPPINGS
+    NODE_DISPLAY_NAME_MAPPINGS = {k:v.TITLE for k,v in NODE_CLASS_MAPPINGS.items()}
+    __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
+	###
+	README.md
+	# ComfyUI-GGUF
+GGUF Quantization support for native ComfyUI models
+
+This is currently very much WIP. These custom nodes provide support for model files stored in the GGUF format popularized by [llama.cpp](https://github.com/ggerganov/llama.cpp).
+
+While quantization wasn't feasible for regular UNET models (conv2d), transformer/DiT models such as flux seem less affected by quantization. This allows running it in much lower bits per weight variable bitrate quants on low-end GPUs. For further VRAM savings, a node to load a quantized version of the T5 text encoder is also included.
+
+![Comfy_Flux1_dev_Q4_0_GGUF_1024](https://github.com/user-attachments/assets/70d16d97-c522-4ef4-9435-633f128644c8)
+
+Note: The "Force/Set CLIP Device" is **NOT** part of this node pack. Do not install it if you only have one GPU. Do not set it to cuda:0 then complain about OOM errors if you do not undestand what it is for. There is not need to copy the workflow above, just use your own workflow and replace the stock "Load Diffusion Model" with the "Unet Loader (GGUF)" node.
+
+## Installation
+
+> [!IMPORTANT]  
+> Make sure your ComfyUI is on a recent-enough version to support custom ops when loading the UNET-only.
+
+To install the custom node normally, git clone this repository into your custom nodes folder (`ComfyUI/custom_nodes`) and install the only dependency for inference (`pip install --upgrade gguf`)
+
+```
+git clone https://github.com/city96/ComfyUI-GGUF
+```
+
+To install the custom node on a standalone ComfyUI release, open a CMD inside the "ComfyUI_windows_portable" folder (where your `run_nvidia_gpu.bat` file is) and use the following commands:
+
+```
+git clone https://github.com/city96/ComfyUI-GGUF ComfyUI/custom_nodes/ComfyUI-GGUF
+.\python_embeded\python.exe -s -m pip install -r .\ComfyUI\custom_nodes\ComfyUI-GGUF\requirements.txt
+```
+
+## Usage
+
+Simply use the GGUF Unet loader found under the `bootleg` category. Place the .gguf model files in your `ComfyUI/models/unet` folder.
+
+LoRA loading is experimental but it should work with just the built-in LoRA loader node(s).
+
+Pre-quantized models:
+
+- [flux1-dev GGUF](https://huggingface.co/city96/FLUX.1-dev-gguf)
+- [flux1-schnell GGUF](https://huggingface.co/city96/FLUX.1-schnell-gguf)
+
+Initial support for quantizing T5 has also been added recently, these can be used using the various `*CLIPLoader (gguf)` nodes which can be used inplace of the regular ones. For the CLIP model, use whatever model you were using before for CLIP. The loader can handle both types of files - `gguf` and regular `safetensors`/`bin`.
+
+- [t5_v1.1-xxl GGUF](https://huggingface.co/city96/t5-v1_1-xxl-encoder-gguf)
+###
+License
+                                 Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+   1. Definitions.
+
+      "License" shall mean the terms and conditions for use, reproduction,
+      and distribution as defined by Sections 1 through 9 of this document.
+
+      "Licensor" shall mean the copyright owner or entity authorized by
+      the copyright owner that is granting the License.
+
+      "Legal Entity" shall mean the union of the acting entity and all
+      other entities that control, are controlled by, or are under common
+      control with that entity. For the purposes of this definition,
+      "control" means (i) the power, direct or indirect, to cause the
+      direction or management of such entity, whether by contract or
+      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+      outstanding shares, or (iii) beneficial ownership of such entity.
+
+      "You" (or "Your") shall mean an individual or Legal Entity
+      exercising permissions granted by this License.
+
+      "Source" form shall mean the preferred form for making modifications,
+      including but not limited to software source code, documentation
+      source, and configuration files.
+
+      "Object" form shall mean any form resulting from mechanical
+      transformation or translation of a Source form, including but
+      not limited to compiled object code, generated documentation,
+      and conversions to other media types.
+
+      "Work" shall mean the work of authorship, whether in Source or
+      Object form, made available under the License, as indicated by a
+      copyright notice that is included in or attached to the work
+      (an example is provided in the Appendix below).
+
+      "Derivative Works" shall mean any work, whether in Source or Object
+      form, that is based on (or derived from) the Work and for which the
+      editorial revisions, annotations, elaborations, or other modifications
+      represent, as a whole, an original work of authorship. For the purposes
+      of this License, Derivative Works shall not include works that remain
+      separable from, or merely link (or bind by name) to the interfaces of,
+      the Work and Derivative Works thereof.
+
+      "Contribution" shall mean any work of authorship, including
+      the original version of the Work and any modifications or additions
+      to that Work or Derivative Works thereof, that is intentionally
+      submitted to Licensor for inclusion in the Work by the copyright owner
+      or by an individual or Legal Entity authorized to submit on behalf of
+      the copyright owner. For the purposes of this definition, "submitted"
+      means any form of electronic, verbal, or written communication sent
+      to the Licensor or its representatives, including but not limited to
+      communication on electronic mailing lists, source code control systems,
+      and issue tracking systems that are managed by, or on behalf of, the
+      Licensor for the purpose of discussing and improving the Work, but
+      excluding communication that is conspicuously marked or otherwise
+      designated in writing by the copyright owner as "Not a Contribution."
+
+      "Contributor" shall mean Licensor and any individual or Legal Entity
+      on behalf of whom a Contribution has been received by Licensor and
+      subsequently incorporated within the Work.
+
+   2. Grant of Copyright License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      copyright license to reproduce, prepare Derivative Works of,
+      publicly display, publicly perform, sublicense, and distribute the
+      Work and such Derivative Works in Source or Object form.
+
+   3. Grant of Patent License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      (except as stated in this section) patent license to make, have made,
+      use, offer to sell, sell, import, and otherwise transfer the Work,
+      where such license applies only to those patent claims licensable
+      by such Contributor that are necessarily infringed by their
+      Contribution(s) alone or by combination of their Contribution(s)
+      with the Work to which such Contribution(s) was submitted. If You
+      institute patent litigation against any entity (including a
+      cross-claim or counterclaim in a lawsuit) alleging that the Work
+      or a Contribution incorporated within the Work constitutes direct
+      or contributory patent infringement, then any patent licenses
+      granted to You under this License for that Work shall terminate
+      as of the date such litigation is filed.
+
+   4. Redistribution. You may reproduce and distribute copies of the
+      Work or Derivative Works thereof in any medium, with or without
+      modifications, and in Source or Object form, provided that You
+      meet the following conditions:
+
+      (a) You must give any other recipients of the Work or
+          Derivative Works a copy of this License; and
+
+      (b) You must cause any modified files to carry prominent notices
+          stating that You changed the files; and
+
+      (c) You must retain, in the Source form of any Derivative Works
+          that You distribute, all copyright, patent, trademark, and
+          attribution notices from the Source form of the Work,
+          excluding those notices that do not pertain to any part of
+          the Derivative Works; and
+
+      (d) If the Work includes a "NOTICE" text file as part of its
+          distribution, then any Derivative Works that You distribute must
+          include a readable copy of the attribution notices contained
+          within such NOTICE file, excluding those notices that do not
+          pertain to any part of the Derivative Works, in at least one
+          of the following places: within a NOTICE text file distributed
+          as part of the Derivative Works; within the Source form or
+          documentation, if provided along with the Derivative Works; or,
+          within a display generated by the Derivative Works, if and
+          wherever such third-party notices normally appear. The contents
+          of the NOTICE file are for informational purposes only and
+          do not modify the License. You may add Your own attribution
+          notices within Derivative Works that You distribute, alongside
+          or as an addendum to the NOTICE text from the Work, provided
+          that such additional attribution notices cannot be construed
+          as modifying the License.
+
+      You may add Your own copyright statement to Your modifications and
+      may provide additional or different license terms and conditions
+      for use, reproduction, or distribution of Your modifications, or
+      for any such Derivative Works as a whole, provided Your use,
+      reproduction, and distribution of the Work otherwise complies with
+      the conditions stated in this License.
+
+   5. Submission of Contributions. Unless You explicitly state otherwise,
+      any Contribution intentionally submitted for inclusion in the Work
+      by You to the Licensor shall be under the terms and conditions of
+      this License, without any additional terms or conditions.
+      Notwithstanding the above, nothing herein shall supersede or modify
+      the terms of any separate license agreement you may have executed
+      with Licensor regarding such Contributions.
+
+   6. Trademarks. This License does not grant permission to use the trade
+      names, trademarks, service marks, or product names of the Licensor,
+      except as required for reasonable and customary use in describing the
+      origin of the Work and reproducing the content of the NOTICE file.
+
+   7. Disclaimer of Warranty. Unless required by applicable law or
+      agreed to in writing, Licensor provides the Work (and each
+      Contributor provides its Contributions) on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+      implied, including, without limitation, any warranties or conditions
+      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+      PARTICULAR PURPOSE. You are solely responsible for determining the
+      appropriateness of using or redistributing the Work and assume any
+      risks associated with Your exercise of permissions under this License.
+
+   8. Limitation of Liability. In no event and under no legal theory,
+      whether in tort (including negligence), contract, or otherwise,
+      unless required by applicable law (such as deliberate and grossly
+      negligent acts) or agreed to in writing, shall any Contributor be
+      liable to You for damages, including any direct, indirect, special,
+      incidental, or consequential damages of any character arising as a
+      result of this License or out of the use or inability to use the
+      Work (including but not limited to damages for loss of goodwill,
+      work stoppage, computer failure or malfunction, or any and all
+      other commercial damages or losses), even if such Contributor
+      has been advised of the possibility of such damages.
+
+   9. Accepting Warranty or Additional Liability. While redistributing
+      the Work or Derivative Works thereof, You may choose to offer,
+      and charge a fee for, acceptance of support, warranty, indemnity,
+      or other liability obligations and/or rights consistent with this
+      License. However, in accepting such obligations, You may act only
+      on Your own behalf and on Your sole responsibility, not on behalf
+      of any other Contributor, and only if You agree to indemnify,
+      defend, and hold each Contributor harmless for any liability
+      incurred by, or claims asserted against, such Contributor by reason
+      of your accepting any such warranty or additional liability.
+
+   END OF TERMS AND CONDITIONS
+
+   APPENDIX: How to apply the Apache License to your work.
+
+      To apply the Apache License to your work, attach the following
+      boilerplate notice, with the fields enclosed by brackets "[]"
+      replaced with your own identifying information. (Don't include
+      the brackets!)  The text should be enclosed in the appropriate
+      comment syntax for the file format. We also recommend that a
+      file or class name and description of purpose be included on the
+      same "printed page" as the copyright notice for easier
+      identification within third-party archives.
+
+   Copyright [yyyy] [name of copyright owner]
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+###
+tools/read_tensors.py
+#!/usr/bin/python3
+import os
+import sys
+import gguf
+
+def read_tensors(path):
+    reader = gguf.GGUFReader(path)
+    for tensor in reader.tensors:
+        if tensor.tensor_type == gguf.GGMLQuantizationType.F32:
+            continue
+        print(f"{str(tensor.tensor_type):32}: {tensor.name}")
+
+try:
+    path = sys.argv[1]
+    assert os.path.isfile(path), "Invalid path"
+    print(f"input: {path}")
+except Exception as e:
+    input(f"failed: {e}")
+else:
+    read_tensors(path)
+    input()
+###
+tools/lcpp.patch
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 1d2a3540..b1a9ee96 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -230,7 +230,7 @@
+ #define GGML_MAX_CONTEXTS       64
+ #define GGML_MAX_SRC            10
+ #ifndef GGML_MAX_NAME
+-#define GGML_MAX_NAME           64
++#define GGML_MAX_NAME          128
+ #endif
+ #define GGML_MAX_OP_PARAMS      64
+ #define GGML_DEFAULT_N_THREADS  4
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 5ab65ea9..35580d9d 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -212,6 +212,9 @@ enum llm_arch {
+     LLM_ARCH_JAIS,
+     LLM_ARCH_NEMOTRON,
+     LLM_ARCH_EXAONE,
++    LLM_ARCH_FLUX,
++    LLM_ARCH_SD1,
++    LLM_ARCH_SDXL,
+     LLM_ARCH_UNKNOWN,
+ };
+
+@@ -259,6 +262,9 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
+     { LLM_ARCH_JAIS,            "jais"         },
+     { LLM_ARCH_NEMOTRON,        "nemotron"     },
+     { LLM_ARCH_EXAONE,          "exaone"       },
++    { LLM_ARCH_FLUX,            "flux"         },
++    { LLM_ARCH_SD1,             "sd1"          },
++    { LLM_ARCH_SDXL,            "sdxl"         },
+     { LLM_ARCH_UNKNOWN,         "(unknown)"    },
+ };
+
+@@ -1337,6 +1343,9 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
+             { LLM_TENSOR_FFN_UP,          "blk.%d.ffn_up" },
+         },
+     },
++    { LLM_ARCH_FLUX, {}},
++    { LLM_ARCH_SD1,  {}},
++    { LLM_ARCH_SDXL, {}},
+     {
+         LLM_ARCH_UNKNOWN,
+         {
+@@ -4629,6 +4638,12 @@ static void llm_load_hparams(
+     // get general kv
+     ml.get_key(LLM_KV_GENERAL_NAME, model.name, false);
+
++    // Disable LLM metadata for image models
++    if (model.arch == LLM_ARCH_FLUX || model.arch == LLM_ARCH_SD1 || model.arch == LLM_ARCH_SDXL) {
++        model.ftype = ml.ftype;
++        return;
++    }
++
+     // get hparams kv
+     ml.get_key(LLM_KV_VOCAB_SIZE, hparams.n_vocab, false) || ml.get_arr_n(LLM_KV_TOKENIZER_LIST, hparams.n_vocab);
+
+@@ -15827,11 +15842,162 @@ static void llama_tensor_dequantize_internal(
+     workers.clear();
+ }
+
++static ggml_type img_tensor_get_type(quantize_state_internal & qs, ggml_type new_type, const ggml_tensor * tensor, llama_ftype ftype) {
++    // Special function for quantizing image model tensors
++    const std::string name = ggml_get_name(tensor);
++    const llm_arch arch = qs.model.arch;
++
++    // Sanity check
++    if (
++            (name.find("model.diffusion_model.") != std::string::npos) ||
++            (name.find("first_stage_model.") != std::string::npos) ||
++            (name.find("single_transformer_blocks.") != std::string::npos)
++        ) {
++            throw std::runtime_error("Invalid input GGUF file. This is not a supported UNET model");
++    }
++
++    // Unsupported quant types - exclude all IQ quants for now
++    if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS  ||
++        ftype == LLAMA_FTYPE_MOSTLY_IQ2_S   || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M  ||
++        ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ1_S  ||
++        ftype == LLAMA_FTYPE_MOSTLY_IQ1_M   || ftype == LLAMA_FTYPE_MOSTLY_IQ4_NL ||
++        ftype == LLAMA_FTYPE_MOSTLY_IQ4_XS  || ftype == LLAMA_FTYPE_MOSTLY_IQ3_S  ||
++        ftype == LLAMA_FTYPE_MOSTLY_IQ3_M   || ftype == LLAMA_FTYPE_MOSTLY_Q4_0_4_4 ||
++        ftype == LLAMA_FTYPE_MOSTLY_Q4_0_4_8 || ftype == LLAMA_FTYPE_MOSTLY_Q4_0_8_8) {
++        throw std::runtime_error("Invalid quantization type for image model (Not supported)");
++    }
++
++    if ( // Tensors to keep in FP32 precision
++        (arch == LLM_ARCH_FLUX) && (
++            (name.find("img_in.") != std::string::npos) ||
++            (name.find("time_in.in_layer.") != std::string::npos) ||
++            (name.find("vector_in.in_layer.") != std::string::npos) ||
++            (name.find("guidance_in.in_layer.") != std::string::npos) ||
++            (name.find("final_layer.linear.") != std::string::npos)
++        ) || (arch == LLM_ARCH_SD1 || arch == LLM_ARCH_SDXL) && (
++            (name.find("conv_in.") != std::string::npos) ||
++            (name.find("conv_out.") != std::string::npos) ||
++            (name == "input_blocks.0.0.weight") ||
++            (name == "out.2.weight")
++        )) {
++            new_type = GGML_TYPE_F32;
++    } else if ( // Tensors to keep in FP16 precision
++        (arch == LLM_ARCH_FLUX) && (
++            (name.find("txt_in.") != std::string::npos) ||
++            (name.find("time_in.") != std::string::npos) ||
++            (name.find("vector_in.") != std::string::npos) ||
++            (name.find("guidance_in.") != std::string::npos) ||
++            (name.find("final_layer.") != std::string::npos)
++        ) || (arch == LLM_ARCH_SD1 || arch == LLM_ARCH_SDXL) && (
++            (name.find("class_embedding.") != std::string::npos) ||
++            (name.find("time_embedding.") != std::string::npos) ||
++            (name.find("add_embedding.") != std::string::npos) ||
++            (name.find("time_embed.") != std::string::npos) ||
++            (name.find("label_emb.") != std::string::npos) ||
++            (name.find("proj_in.") != std::string::npos) ||
++            (name.find("proj_out.") != std::string::npos)
++            // (name.find("conv_shortcut.") != std::string::npos) // marginal improvement
++        )) {
++            new_type = GGML_TYPE_F16;
++    } else if ( // Rules for to_v attention
++            (name.find("attn_v.weight") != std::string::npos) ||
++            (name.find(".to_v.weight") != std::string::npos)
++        ){
++            if (ftype == LLAMA_FTYPE_MOSTLY_Q2_K) {
++                new_type = GGML_TYPE_Q3_K;
++            }
++            else if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_M) {
++                new_type = qs.i_attention_wv < 2 ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K;
++            }
++            else if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L) {
++                new_type = GGML_TYPE_Q5_K;
++            }
++            else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_M || ftype == LLAMA_FTYPE_MOSTLY_Q5_K_M) {
++                new_type = GGML_TYPE_Q6_K;
++            }
++            else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_S && qs.i_attention_wv < 4) {
++                new_type = GGML_TYPE_Q5_K;
++            }
++            ++qs.i_attention_wv;
++    } else if ( // Rules for fused qkv attention
++            (name.find("attn_qkv.weight") != std::string::npos) ||
++            (name.find("attn.qkv.weight") != std::string::npos)
++        ) {
++            if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_M || ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L) {
++                new_type = GGML_TYPE_Q4_K;
++            }
++            else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_M) {
++                new_type = GGML_TYPE_Q5_K;
++            }
++            else if (ftype == LLAMA_FTYPE_MOSTLY_Q5_K_M) {
++                new_type = GGML_TYPE_Q6_K;
++            }
++    } else if ( // Rules for ffn
++            (name.find("ffn_down") != std::string::npos) ||
++            (name.find("DenseReluDense.wo") != std::string::npos)
++        ) {
++            // TODO: add back `layer_info` with some model specific logic + logic further down
++            if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_M) {
++                new_type = GGML_TYPE_Q4_K;
++            }
++            else if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L) {
++                new_type = GGML_TYPE_Q5_K;
++            }
++            else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_S) {
++                new_type = GGML_TYPE_Q5_K;
++            }
++            else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_M) {
++                new_type = GGML_TYPE_Q6_K;
++            }
++            else if (ftype == LLAMA_FTYPE_MOSTLY_Q5_K_M) {
++                new_type = GGML_TYPE_Q6_K;
++            }
++            else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_0) {
++                new_type = GGML_TYPE_Q4_1;
++            }
++            else if (ftype == LLAMA_FTYPE_MOSTLY_Q5_0) {
++                new_type = GGML_TYPE_Q5_1;
++            }
++            ++qs.i_ffn_down;
++    }
++
++    // Sanity check for row shape
++    bool convert_incompatible_tensor = false;
++    if (new_type == GGML_TYPE_Q2_K    || new_type == GGML_TYPE_Q3_K    || new_type == GGML_TYPE_Q4_K   ||
++        new_type == GGML_TYPE_Q5_K    || new_type == GGML_TYPE_Q6_K) {
++        int nx = tensor->ne[0];
++        int ny = tensor->ne[1];
++        if (nx % QK_K != 0) {
++            LLAMA_LOG_WARN("\n\n%s : tensor cols %d x %d are not divisible by %d, required for %s", __func__, nx, ny, QK_K, ggml_type_name(new_type));
++            convert_incompatible_tensor = true;
++        } else {
++            ++qs.n_k_quantized;
++        }
++    }
++    if (convert_incompatible_tensor) {
++        // TODO: Possibly reenable this in the future
++        // switch (new_type) {
++        //     case GGML_TYPE_Q2_K:
++        //     case GGML_TYPE_Q3_K:
++        //     case GGML_TYPE_Q4_K:   new_type = GGML_TYPE_Q5_0;   break;
++        //     case GGML_TYPE_Q5_K:   new_type = GGML_TYPE_Q5_1;   break;
++        //     case GGML_TYPE_Q6_K:   new_type = GGML_TYPE_Q8_0;   break;
++        //     default: throw std::runtime_error("\nUnsupported tensor size encountered\n");
++        // }
++        new_type = GGML_TYPE_F16;
++        LLAMA_LOG_WARN(" - using fallback quantization %s\n", ggml_type_name(new_type));
++        ++qs.n_fallback;
++    }
++    return new_type;
++}
++
++
+ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type new_type, const ggml_tensor * tensor, llama_ftype ftype) {
+     const std::string name = ggml_get_name(tensor);
+
+     // TODO: avoid hardcoded tensor names - use the TN_* constants
+     const llm_arch arch = qs.model.arch;
++    if (arch == LLM_ARCH_FLUX || arch == LLM_ARCH_SD1 || arch == LLM_ARCH_SDXL) { return img_tensor_get_type(qs, new_type, tensor, ftype); };
+     const auto       tn = LLM_TN(arch);
+
+     auto use_more_bits = [](int i_layer, int n_layers) -> bool {
+	###
+	tools/convert.py
+	# (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
+import os
+import torch
+import gguf # This needs to be the llama.cpp one specifically!
+import argparse
+from tqdm import tqdm
+
+from safetensors.torch import load_file
+
+QUANTIZATION_THRESHOLD = 1024
+REARRANGE_THRESHOLD = 512
+MAX_TENSOR_NAME_LENGTH = 127
+
+# Tuple of arch_name, match_lists.
+# Each item in match_lists is a tuple of keys that must match.
+# All keys in a match_lists item must exist for the architecture to match.
+# The architectures are checked in order and the first successful match terminates the search.
+MODEL_DETECTION = (
+    ("flux", (
+        ("transformer_blocks.0.attn.norm_added_k.weight",),
+        ("double_blocks.0.img_attn.proj.weight",),
+    )),
+    ("sd3", (
+        ("transformer_blocks.0.attn.add_q_proj.weight",),
+    )),
+    ("sdxl", (
+        ("down_blocks.0.downsamplers.0.conv.weight", "add_embedding.linear_1.weight",),
+        (
+            "input_blocks.3.0.op.weight", "input_blocks.6.0.op.weight",
+            "output_blocks.2.2.conv.weight", "output_blocks.5.2.conv.weight",
+        ), # Non-diffusers
+        ("label_emb.0.0.weight",),
+    )),
+    ("sd1", (
+        ("down_blocks.0.downsamplers.0.conv.weight",),
+        (
+            "input_blocks.3.0.op.weight", "input_blocks.6.0.op.weight", "input_blocks.9.0.op.weight",
+            "output_blocks.2.1.conv.weight", "output_blocks.5.2.conv.weight", "output_blocks.8.2.conv.weight"
+        ), # Non-diffusers
+    )),
+)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Generate F16 GGUF files from single UNET")
+    parser.add_argument("--src", required=True, help="Source model ckpt file.")
+    parser.add_argument("--dst", help="Output unet gguf file.")
+    args = parser.parse_args()
+
+    if not os.path.isfile(args.src):
+        parser.error("No input provided!")
+
+    return args
+
+def load_state_dict(path):
+    if any(path.endswith(x) for x in [".ckpt", ".pt", ".bin", ".pth"]):
+        state_dict = torch.load(path, map_location="cpu", weights_only=True)
+        state_dict = state_dict.get("model", state_dict)
+    else:
+        state_dict = load_file(path)
+
+    # only keep unet with no prefix!
+    sd = {}
+    has_prefix = any(["model.diffusion_model." in x for x in state_dict.keys()])
+    for k, v in state_dict.items():
+        if has_prefix and "model.diffusion_model." not in k:
+            continue
+        if has_prefix:
+            k = k.replace("model.diffusion_model.", "")
+        sd[k] = v
+
+    return sd
+
+def detect_arch(state_dict):
+    for arch, match_lists in MODEL_DETECTION:
+        for match_list in match_lists:
+            if all(key in state_dict for key in match_list):
+                return arch
+    breakpoint()
+    raise ValueError("Unknown model architecture!")
+
+
+def load_model(path):
+    state_dict = load_state_dict(path)
+    arch = detect_arch(state_dict)
+    print(f"* Architecture detected from input: {arch}")
+    if arch == "flux" and "transformer_blocks.0.attn.norm_added_k.weight" in state_dict:
+        raise ValueError("The Diffusers UNET can not be used for this!")
+    writer = gguf.GGUFWriter(path=None, arch=arch)
+    return (writer, state_dict)
+
+def handle_tensors(args, writer, state_dict):
+    # TODO list:
+    # - do something about this being awful and hacky
+
+    name_lengths = tuple(sorted(
+        ((key, len(key)) for key in state_dict.keys()),
+        key=lambda item: item[1],
+        reverse=True,
+    ))
+    if not name_lengths:
+        return
+    max_name_len = name_lengths[0][1]
+    if max_name_len > MAX_TENSOR_NAME_LENGTH:
+        bad_list = ", ".join(f"{key!r} ({namelen})" for key, namelen in name_lengths if namelen > MAX_TENSOR_NAME_LENGTH)
+        raise ValueError(f"Can only handle tensor names up to {MAX_TENSOR_NAME_LENGTH} characters. Tensors exceeding the limit: {bad_list}")
+    for key, data in tqdm(state_dict.items()):
+        old_dtype = data.dtype
+
+        if data.dtype == torch.bfloat16:
+            data = data.to(torch.float32).numpy()
+        # this is so we don't break torch 2.0.X
+        elif data.dtype in [getattr(torch, "float8_e4m3fn", "_invalid"), getattr(torch, "float8_e5m2", "_invalid")]:
+            data = data.to(torch.float16).numpy()
+        else:
+            data = data.numpy()
+
+        n_dims = len(data.shape)
+        data_shape = data.shape
+        data_qtype = getattr(
+            gguf.GGMLQuantizationType,
+            "BF16" if old_dtype == torch.bfloat16 else "F16"
+        )
+
+        # get number of parameters (AKA elements) in this tensor
+        n_params = 1
+        for dim_size in data_shape:
+            n_params *= dim_size
+
+        # keys to keep as max precision
+        blacklist = {
+            "time_embedding.",
+            "add_embedding.",
+            "time_in.",
+            "txt_in.",
+            "vector_in.",
+            "img_in.",
+            "guidance_in.",
+            "final_layer.",
+        }
+
+        if old_dtype in (torch.float32, torch.bfloat16):
+            if n_dims == 1:
+                # one-dimensional tensors should be kept in F32
+                # also speeds up inference due to not dequantizing
+                data_qtype = gguf.GGMLQuantizationType.F32
+
+            elif n_params <= QUANTIZATION_THRESHOLD:
+                # very small tensors
+                data_qtype = gguf.GGMLQuantizationType.F32
+
+            elif ".weight" in key and any(x in key for x in blacklist):
+                data_qtype = gguf.GGMLQuantizationType.F32
+
+        if (    n_dims > 1                              # Skip one-dimensional tensors
+            and n_params >= REARRANGE_THRESHOLD         # Only rearrange tensors meeting the size requirement
+            and (n_params / 256).is_integer()           # Rearranging only makes sense if total elements is divisible by 256
+            and not (data.shape[-1] / 256).is_integer() # Only need to rearrange if the last dimension is not divisible by 256
+        ):
+            orig_shape = data.shape
+            data = data.reshape(n_params // 256, 256)
+            writer.add_array(f"comfy.gguf.orig_shape.{key}", tuple(int(dim) for dim in orig_shape))
+
+        try:
+            data = gguf.quants.quantize(data, data_qtype)
+        except (AttributeError, gguf.QuantError) as e:
+            tqdm.write(f"falling back to F16: {e}")
+            data_qtype = gguf.GGMLQuantizationType.F16
+            data = gguf.quants.quantize(data, data_qtype)
+
+        new_name = key # do we need to rename?
+
+        shape_str = f"{{{', '.join(str(n) for n in reversed(data.shape))}}}"
+        tqdm.write(f"{f'%-{max_name_len + 4}s' % f'{new_name}'} {old_dtype} --> {data_qtype.name}, shape = {shape_str}")
+
+        writer.add_tensor(new_name, data, raw_dtype=data_qtype)
+
+if __name__ == "__main__":
+    args = parse_args()
+    path = args.src
+    writer, state_dict = load_model(path)
+
+    writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
+    if next(iter(state_dict.values())).dtype == torch.bfloat16:
+        out_path = f"{os.path.splitext(path)[0]}-BF16.gguf"
+        writer.add_file_type(gguf.LlamaFileType.MOSTLY_BF16)
+    else:
+        out_path = f"{os.path.splitext(path)[0]}-F16.gguf"
+        writer.add_file_type(gguf.LlamaFileType.MOSTLY_F16)
+
+    out_path = args.dst or out_path
+    if os.path.isfile(out_path):
+        input("Output exists enter to continue or ctrl+c to abort!")
+
+    handle_tensors(path, writer, state_dict)
+    writer.write_header_to_file(path=out_path)
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file(progress=True)
+    writer.close()
+	###
+	tools/README.md
+	This needs the llama.cpp version of gguf-py to work at the moment, not the pip one as that one does not have the python quantization code yet.
+
+```
+git clone https://github.com/ggerganov/llama.cpp
+pip install llama.cpp/gguf-py
+```
+
+
+To convert your initial source model to FP16 (or BF16), run the following command:
+```
+python convert.py --src E:\models\unet\flux1-dev.safetensors
+```
+
+
+To quantize the model, first apply the provided patch to the llama.cpp repo you've just cloned. If you get a "corrupt patch" error, you may have to [change the line endings in the patch file](https://github.com/city96/ComfyUI-GGUF/issues/90#issuecomment-2323011648).
+```
+cd llama.cpp
+git checkout tags/b3600
+git apply ..\lcpp.patch
+```
+
+
+Then, compile the llama-quantize binary. This example uses cmake, on linux you can just use make.
+```
+mkdir build
+cd build
+cmake ..
+cmake --build . --config Debug -j10 --target llama-quantize
+cd ..
+cd ..
+```
+
+
+Now you can use the newly build binary to quantize your model to the desired format:
+```
+llama.cpp\build\bin\Debug\llama-quantize.exe E:\models\unet\flux1-dev-BF16.gguf E:\models\unet\flux1-dev-Q4_K_S.gguf Q4_K_S
+```
+
+
+You can extract the patch again with `git diff src\llama.cpp > lcpp.patch` if you wish to change something and contribute back.
+
+
+> [!WARNING]  
+> Do not use the diffusers UNET for flux, it won't work, use the default/reference checkpoint format. This is due to q/k/v being merged into one qkv key. You can convert it by loading it in ComfyUI and saving it using the built-in "ModelSave" node.
+
+
+> [!WARNING]  
+> Do not quantize SDXL / SD1 / other Conv2D heavy models. There's little to no benefit with these models. If you do, make sure to **extract the UNET model first**.
+>This should be obvious, but also don't use the resulting llama-quantize binary with LLMs.
