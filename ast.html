@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Text Input with Enter Button</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .input-container {
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="input-container">
+        <input type="text" id="textInput" placeholder="Type something..." />
+        <button id="enterButton">Enter</button>
+    </div>
+
+    <script>
+        document.getElementById('enterButton').addEventListener('click', () => {
+            const booleanExpression = document.getElementById('textInput').value;
+            const parser = new BooleanParser(booleanExpression);
+            const ast = parser.parse();
+            printAST(ast);
+
+            console.log("AST:", JSON.stringify(ast, null, 2));
+
+            const dataSet = [
+                "cat food",
+                "dog food",
+                "chicken food",
+                "George likes banjos",
+                "cat toy",
+                "dog collar",
+            ];
+
+            const evaluator = new BooleanEvaluator(dataSet);
+            const result = evaluator.evaluate(ast);
+
+            console.log("Matching Results:", result);
+            console.log(extractKeywords(ast));
+        });
+
+        // AST Node Class
+        class ASTNode {
+            constructor(type, value = null, children = []) {
+                this.type = type;       // Node type: "AND", "OR", "NOT", "Literal"
+                this.value = value;     // Value for literals (e.g., "cat", "dog")
+                this.children = children; // Child nodes
+            }
+        }
+
+        // Parser for Boolean Strings
+        class BooleanParser {
+            constructor(expression) {
+                this.expression = expression;
+                this.tokens = [];
+                this.currentTokenIndex = 0;
+            }
+
+            // Tokenize the input string
+            tokenize() {
+                const regex = /\(|\)|AND|OR|NOT|[a-zA-Z0-9]+/g;
+                this.tokens = this.expression.match(regex) || [];
+            }
+
+            // Peek at the current token
+            peek() {
+                return this.tokens[this.currentTokenIndex];
+            }
+
+            // Consume the current token
+            consume() {
+                return this.tokens[this.currentTokenIndex++];
+            }
+
+            // Parse the expression and build the AST
+            parseExpression() {
+                let node = this.parseTerm();
+
+                while (this.peek() === "AND") {
+                    this.consume(); // Consume "AND"
+                    node = new ASTNode("AND", null, [node, this.parseTerm()]);
+                }
+
+                return node;
+            }
+
+            parseTerm() {
+                let node = this.parseFactor();
+
+                while (this.peek() === "OR") {
+                    this.consume(); // Consume "OR"
+                    node = new ASTNode("OR", null, [node, this.parseFactor()]);
+                }
+
+                return node;
+            }
+
+            parseFactor() {
+                if (this.peek() === "NOT") {
+                    this.consume(); // Consume "NOT"
+                    return new ASTNode("NOT", null, [this.parseFactor()]);
+                } else if (this.peek() === "(") {
+                    this.consume(); // Consume "("
+                    const node = this.parseExpression();
+                    this.consume(); // Consume ")"
+                    return node;
+                } else {
+                    const literal = this.consume(); // Consume literal
+                    return new ASTNode("Literal", literal);
+                }
+            }
+
+            parse() {
+                this.tokenize();
+                return this.parseExpression();
+            }
+        }
+
+
+        // Evaluator for the AST
+        class BooleanEvaluator {
+
+            constructor(dataSet) {
+                this.dataSet = dataSet; // Set of strings to search
+            }
+
+            evaluate(node) {
+                let val = false;
+                switch (node.type) {
+                    case "AND":
+                        // Intersection of results from both children
+                        val = this.evaluate(node.children[0]).filter(item =>
+                            this.evaluate(node.children[1]).includes(item)
+                        );
+                        // console.log(node);
+                        // console.log(val);
+                        return val;
+                    case "OR":
+                        // Union of results from both children
+                        val = [...new Set([
+                            ...this.evaluate(node.children[0]),
+                            ...this.evaluate(node.children[1]),
+                        ])];
+                        // console.log(node);
+                        // console.log(val);
+                        return val;
+                    case "NOT":
+                        // Negation of results from the child node
+                        const exclude = this.evaluate(node.children[0]);
+                        val = this.dataSet.filter(item => !exclude.includes(item));
+                        // console.log(node);
+                        // console.log(val);
+                        return val;
+                    case "Literal":
+                        // Filter dataset for strings containing the literal value
+                        val = this.dataSet.filter(item =>
+                            item.toLowerCase().includes(node.value.toLowerCase())
+                        );
+                        // console.log(node);
+                        // console.log(val);
+                        return val;
+                    default:
+                        throw new Error(`Unknown node type: ${node.type}`);
+                }
+            }
+        }
+
+        function printAST(node, indent = 0) {
+            // Create a string of spaces for indentation
+            const prefix = "  ".repeat(indent);
+
+            // Print the current node
+            let output = `${prefix}- ${node.type}`;
+            if (node.value !== null) {
+                output += `: ${node.value}`;
+            }
+            console.log(output);
+
+            // Recursively print child nodes
+            if (node.children && node.children.length > 0) {
+                node.children.forEach((child) => printAST(child, indent + 1));
+            }
+        }
+
+        function extractKeywords(node) {
+            let keywords = [];
+
+            if (node.type === "Literal") {
+                // Add the literal value to the keywords array
+                keywords.push(node.value);
+            } else if (node.children && node.children.length > 0) {
+                // Recursively extract keywords from child nodes
+                for (let child of node.children) {
+                    keywords = keywords.concat(extractKeywords(child));
+                }
+            }
+            return keywords;
+        }
+
+
+    </script>
+</body>
+</html>
