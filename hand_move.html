@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Velocity.js Animation</title>
+  <script src="velocity.min.js"></script>
+  <style>
+    body {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 100vh;
+        margin: 0;
+        overflow: hidden;
+        background-image: url('background.png');
+        background-size: cover; /* Ensures the image covers the entire element */
+        background-position: center center; /* Center the background image */
+    }
+    /* body {
+        position: relative;
+        background-image: url('background.jpg');
+        background-size: cover;
+        background-position: center center;
+    } */
+
+    body::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background-color: rgba(0, 0, 0, 0.5); /* Black overlay with 30% opacity */
+        z-index: -1; /* Ensures the overlay is behind the content */
+    }
+
+
+    .container {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      position: relative;
+    }
+
+    .image {
+      width: 600px;
+      height: 600px;
+      position: relative; /* Ensure positioning for animation */
+    }
+
+    .image img {
+      width: 100%;
+      height: 100%;
+    }
+
+    #crystal-ball {
+      width: 600px;
+      height: 600px;
+      z-index: 999;
+      position: relative; /* Relative for animation */
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="image" id="left-image">
+      <img src="left_hand.png" alt="Left Image">
+    </div>
+    <div class="image" id="crystal-ball">
+      <img src="crystalball.png" alt="Crystal Ball">
+    </div>
+    <div class="image" id="right-image">
+      <img src="right_hand.png" alt="Right Image">
+    </div>
+  </div>
+
+  <script>
+
+    function shakeHands() {
+        Velocity(leftImage, { 
+            rotateZ: "55deg"    // Reset rotation
+        }, { duration: 600 })
+        .then(function() {
+            // Final segment: Reset position
+            return Velocity(leftImage, { 
+            rotateZ: "0deg"    // Reset rotation
+            }, { duration: 600 });
+        });
+        Velocity(rightImage, { 
+            rotateZ: "-55deg"    // Reset rotation
+        }, { duration: 600 })
+        .then(function() {
+            // Final segment: Reset position
+            return Velocity(rightImage, { 
+            rotateZ: "0deg"    // Reset rotation
+            }, { duration: 600 });
+        });
+    }
+
+    function transition1() {
+        Velocity(leftImage, { translateX: "-500px" }, { duration: 1000, easing: "ease-in-out" });
+        Velocity(crystalBall, { width: "1300px", height: "1300px" }, { duration: 1000, easing: "ease-in-out" });
+        Velocity(rightImage, { translateX: "500px" }, { duration: 1000, easing: "ease-in-out" });
+    }
+    window.addEventListener("load", function () {
+      const leftImage = document.getElementById("left-image");
+      const crystalBall = document.getElementById("crystal-ball");
+      const rightImage = document.getElementById("right-image");
+
+      // Animate the left image to move slightly left
+      setInterval()
+    });
+  </script>
+</body>
+</html>

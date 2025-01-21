@@ -227,8 +227,6 @@ sorry AMD users - will fix that soon!!! :D
             particle.x += (-0.5 + r1) / 300;
             particle.y += (-0.5 + r2) / 300;
             particle.si = 1 + Math.random() * 4 | 0;
-            // particle.cc = this.randFromList(r2, r3);
-            // particle.cc = this.hue / 365;
 
             particle.s = 0.003 + this.randFromList(r1, r2) / 10;
             particle.l = 0;
@@ -256,21 +254,15 @@ sorry AMD users - will fix that soon!!! :D
         }
 
         renderParticles() {
-
             this.particleMap.forEach((particle) => {
-
                 particle.c.call(this, particle);
-
                 if (!particle.c) {
                     this.particleMap.delete(particle);
                 }
-
             });
-
         }
 
         drawStatic() {
-
             let i = 0;
             const step = 0.001;
 
